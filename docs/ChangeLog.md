@@ -8,46 +8,164 @@ This file records **what changed and why**. For **how to actually use** a new fe
 
 Entries here are folded into the next release's heading when it ships.
 
-**A Grok cell shows how full its context is, and what it has spent (#1470).** #1465 gave every
-agent the two header badges, but grok came out with the model alone: its conversation directory was
-read as holding no token accounting. That was true of the two files that were read (`summary.json`
-and `events.jsonl`) and false of the directory. grok writes `signals.json` — rewritten whole each
-turn, with the current context, the model's REAL window (500,000 for grok-4.5) and the model — and
-one `turn_completed` record per turn in `updates.jsonl` carrying that turn's tokens. So a Grok cell
-now reads `Grok · ctx 33%` with the `⇡ ⇣` token badge beside it, and like codex it never consults
-the client's per-model window table, which has been wrong (#985). The per-turn usage is summed, not
-tailed — it rises and falls per turn, so only the whole file answers — which is affordable because
-the fold from #1377 charges a later poll only for the bytes the last turn appended. grok drives no
-activity flags, so — as for Antigravity, which has the same gap — the badges are refreshed on the
-once-a-minute timer rather than at turn end; without it the first reading a cell took would be the
-only one it ever showed.
+## mulmoterminal@4.6.0 — 2026-08-06
 
-**The launcher's resume list is the picked agent's own history (#1417).** "OR RESUME HERE" read
-`~/.claude/projects` whatever the Agent Picker said, so choosing Codex, Antigravity or Grok still
-offered *Claude's* conversations — and clicking one connected that agent's endpoint to a key that
-only ever named a Claude transcript. Meanwhile every real codex / agy / grok conversation started
-outside a grid cell was unreachable from the UI. The list is now a function of the agent: one route
-per agent (`/api/sessions`, `/api/codex/sessions`, `/api/antigravity/sessions`, and the new
-`/api/grok/sessions`), chosen from a `Record<TerminalAgent, …>` so a fifth agent is a type error
-rather than a picker option that silently lists Claude's history. Switching the picker replaces the
-list, the heading names the agent when it is not Claude, the resume carries the agent so the cell
-connects the endpoint that wrote the conversation, and Shell shows no list at all. A custom agent
-runs Claude Code, so it gets Claude's.
+> **Setup guide:** [Cells that talk to each other, and a history that knows whose it is](https://receptron.github.io/mulmoterminal/guide/en/v4.6.0.html) — written at release time. ([日本語](https://receptron.github.io/mulmoterminal/guide/ja/v4.6.0.html))
 
-The `/api/codex/sessions` and `/api/antigravity/sessions` routes existed since #1096 / #1218 with
-**no caller** — they were built for the single view's sidebar, which #1201 / #1202 removed. This is
-the call site they were kept for. `/api/grok/sessions` is new and is the cheapest of the four:
-`~/.grok/sessions` is partitioned by working directory, so a per-project listing is one directory
-read, with `summary.json` supplying the title and the last-*active* time (not `updated_at`, which
-grok bumps hours later when it generates a title, and which would sort a dead conversation above a
-live one).
+Two cells can now hold a conversation **without you pressing anything between the turns**. Round
+table generalises Cross-terminal talk — one human-pressed round trip since #550 — into a ring of up
+to five seats running for a set number of turns, and it does so without giving the agents a single
+new capability: no MCP tool, no room, no way for an agent to start a conversation or to discover
+that another cell exists. A human picks the seats; the browser's runner reads one cell's answer and
+types it into the next.
 
-All three foreign lists now also carry `attached`, the field that stops a row being opened twice.
-For codex and antigravity it takes the conversation log read backwards: a conversation started from
-a grid cell is held under a session key MulmoTerminal minted, so asking about the conversation id
-alone would report it free while it is live in another cell — and resuming it would start a second
-agent process on it. grok needs no log for this, because MulmoTerminal mints its session id: the
-key and the conversation id are the same string, so the row's own id answers the question.
+The rest of the release is about **the other three agents catching up with Claude**. The launcher's
+resume list was Claude's transcript directory whatever the Agent Picker said, so a Codex, Grok or
+Antigravity conversation started outside a grid cell was unreachable from any screen. And the two
+header badges — the model with its context percentage, and what the conversation has spent — only
+ever appeared on a Claude cell. Both now answer for the agent you actually picked.
+
+### Added
+
+- **Round table — the cells talk to each other, for a set number of turns** ([#1458](https://github.com/receptron/mulmoterminal/pull/1458), refs [#1456](https://github.com/receptron/mulmoterminal/issues/1456) and [#1454](https://github.com/receptron/mulmoterminal/issues/1454)).
+  Open a cell's handoff menu, tick the cells that should take a seat, choose a turn budget, press
+  start. From then on each agent's answer is carried to the next seat as the next prompt, around the
+  ring, until something stops it.
+
+  **No new agent capability, and zero MCP tools.** The runner already does both of the things it
+  would otherwise have handed the agents — it *reads* another cell's last turn (`fetchLastTurn`) and
+  it *types into* a cell and submits (`pasteAndSubmit`) — so the runner does it on their behalf and
+  each agent just talks in its own terminal as always. Two of the three worries raised on #1456
+  therefore disappear rather than being mitigated: an agent cannot start a conversation because it
+  has no tool for it, and cannot find a partner because it cannot see other cells at all.
+
+  The seat picker is **the only admission control**: at most five seats, and a turn budget of 4, 6,
+  10 or 20 (default 6). One turn is one real agent turn, so that number is a runaway guard and a
+  wallet setting at the same time. The ring stops on **agreement** (a reply containing the line
+  `ROUND-TABLE-DONE`, matched whole-line so that *discussing* the marker does not end the
+  conversation), on the budget, on a seat not answering in time, on you pressing stop, on the cell's
+  session being swapped, and on a failed send. Closing the cell stops it too.
+
+  One trap is worth recording, because getting it backwards silently corrupts the ring: the framing
+  text ("your turn", "write the marker if you agree") is always a **prefix**. Replies are correlated
+  to sends by the *last* 160 characters of what was sent — the opening is identical every round — so
+  appending the framing would make every round's tail identical, match the *previous* round's
+  prompt, and read a reply that has not arrived yet as the answer. A spec pins the failure.
+
+  This is v1, and the runner lives in the browser: closing the tab ends the ring. No room store, no
+  HTTP API, no MCP tools, no human or shell seats, no persisted minutes — [#1456](https://github.com/receptron/mulmoterminal/issues/1456) stays open for those.
+
+- **The launcher's resume list is the picked agent's own history** ([#1449](https://github.com/receptron/mulmoterminal/pull/1449), closes [#1417](https://github.com/receptron/mulmoterminal/issues/1417)).
+  "OR RESUME HERE" read `~/.claude/projects` whatever the Agent Picker said, so choosing Codex,
+  Antigravity or Grok still offered *Claude's* conversations — and clicking one connected that
+  agent's endpoint to a key that only ever named a Claude transcript. Meanwhile every real codex /
+  agy / grok conversation started outside a grid cell was unreachable from the UI.
+
+  The list is now a function of the agent: one route per agent (`/api/sessions`,
+  `/api/codex/sessions`, `/api/antigravity/sessions`, and the new `/api/grok/sessions`), chosen from
+  a `Record<TerminalAgent, …>` so a fifth agent is a type error rather than a picker option that
+  silently lists Claude's history. Switching the picker replaces the list, the heading names the
+  agent when it is not Claude, the resume carries the agent so the cell connects the endpoint that
+  wrote the conversation, and Shell shows no list at all. A custom agent runs Claude Code, so it
+  gets Claude's.
+
+  The `/api/codex/sessions` and `/api/antigravity/sessions` routes existed since #1096 / #1218 with
+  **no caller** — they were built for the single view's sidebar, which #1201 / #1202 removed. This
+  is the call site they were kept for. `/api/grok/sessions` is new and is the cheapest of the four:
+  `~/.grok/sessions` is partitioned by working directory, so a per-project listing is one directory
+  read, with `summary.json` supplying the title and the last-*active* time (not `updated_at`, which
+  grok bumps hours later when it generates a title, and which would sort a dead conversation above a
+  live one).
+
+  All three foreign lists now also carry `attached`, the field that stops a row being opened twice.
+  For codex and antigravity it takes the conversation log read backwards: a conversation started
+  from a grid cell is held under a session key MulmoTerminal minted, so asking about the
+  conversation id alone would report it free while it is live in another cell — and resuming it
+  would start a second agent process on it. grok needs no log for this, because MulmoTerminal mints
+  its session id: the key and the conversation id are the same string, so the row's own id answers
+  the question.
+
+- **Every agent's cell says which model it is running and how full its context is** ([#1466](https://github.com/receptron/mulmoterminal/pull/1466), closes [#1465](https://github.com/receptron/mulmoterminal/issues/1465)).
+  The two badges on the first line of a cell header — `Opus · ctx 35%` and `⇡427k ⇣1.8k` — appeared
+  on Claude cells alone. This was never a UI decision: `modelBadge.ts` has always been
+  agent-agnostic, and the badges hide themselves when there is nothing to show. The cause was that
+  `readSessionSummary`, behind `GET /api/session/:id`, read only Claude Code's transcript format, so
+  the other three agents got `{ model: null }` and zeroes.
+
+  The route now picks a reader from `?agent=`. **Claude's path is untouched** — no parameter means
+  claude, and those two fields still come out of the summary fold the route already ran. Each agent
+  answers only from what its own log actually records: Codex reports `gpt-5.5 · ctx 33%` from
+  `token_count` events, with the window taken from codex's own `model_context_window` rather than
+  the client's per-model table, which has been wrong (#985). When no tokens have been counted at
+  all, the model name is shown without `ctx 0%` — the absence of a reading is not a measurement of
+  an empty context.
+
+- **An Antigravity cell reads its real model, context and token usage** ([#1469](https://github.com/receptron/mulmoterminal/pull/1469)).
+  #1466 gave agy the fixed label `antigravity`, on the reading that its logs record neither a model
+  id nor tokens. Measured against the data, that was wrong on all three counts. agy writes the model
+  it is on at the start of **every** conversation (50 of 50 transcripts, always at step 0), which
+  makes it a fact about *that conversation* — unlike `settings.json`, which is global and current.
+  So the badge reads `Gemini 3.6 Flash` from the transcript's head, `ctx 78%` against agy's measured
+  256,000-token window, and `⇡ ⇣` beside it.
+
+  There is no schema for any of it, so every layer is built to show **nothing rather than something
+  wrong**: the parser walks only the requested path and stops without resynchronising at bytes it
+  does not understand, and the accounting layer discards the *whole* answer when a window is outside
+  1 KB–100 M, when `used` exceeds the window, when a count passes a billion, or when a leaf is
+  missing — a partial sum is not a small number, it is a wrong one. The two badges are independent,
+  so an unreadable accounting still leaves the model name. If agy renumbers its fields, the cell
+  falls back to the model name alone; it will not print a wrong percentage.
+
+- **A Grok cell shows how full its context is, and what it has spent** ([#1471](https://github.com/receptron/mulmoterminal/pull/1471), closes [#1470](https://github.com/receptron/mulmoterminal/issues/1470)).
+  #1466 left grok with the model alone, on the finding that its conversation directory holds no
+  token accounting. That was true of the two files it read (`summary.json`, `events.jsonl`) and
+  false of the directory. grok writes `signals.json` — rewritten whole each turn, carrying the
+  current context, the model's real window (500,000 for grok-4.5) and the model — plus one
+  `turn_completed` record per turn in `updates.jsonl` with that turn's tokens. So a Grok cell now
+  reads `Grok · ctx 33%` with the `⇡ ⇣` badge beside it, and like codex it never consults the
+  client's window table.
+
+  The per-turn usage is summed rather than tailed — it rises and falls per turn, so only the whole
+  file answers — which stays affordable because the fold from #1377 charges a later poll only for
+  the bytes the last turn appended. Neither grok nor antigravity drives activity flags, so their
+  badges refresh on the once-a-minute timer instead of at turn end; without it, the first reading a
+  cell took would be the only one it ever showed.
+
+- **A conversation left running with nobody attached says so, and can be stopped from the launcher** ([#1474](https://github.com/receptron/mulmoterminal/pull/1474), part of [#1467](https://github.com/receptron/mulmoterminal/issues/1467)).
+  The `or resume here` rows already answered "is anyone holding this" via `tmux list-clients` —
+  which reports **only** sessions that have a client, so the sessions that actually accumulate,
+  running with nobody attached after a server restart, were structurally invisible to it. One
+  `tmux list-sessions` per list was what was missing. Such rows are now marked, and only they get a
+  **stop** button: a row marked `● open` belongs to the terminal holding it, and ending it from
+  another cell's launch form would pull a session out from under a tab you cannot see from here.
+
+  It asks before stopping, because the in-flight turn is lost. The conversation is not — the
+  transcript stays and the row can be resumed afterwards. What is stopped is the *session key*
+  MulmoTerminal minted, not the row's conversation id; for codex and agy those differ, and killing
+  the wrong one would report success having killed nothing.
+
+  **[#1467](https://github.com/receptron/mulmoterminal/issues/1467) stays open.** It asks for
+  automatic cleanup, and this is the manual half. The list is per directory and per agent, so it
+  does not reach a project you no longer open — which is where the reporter's sessions are. Measured
+  on one machine with 21 surviving sessions: 12 attached, **5 unattached with claude still running**
+  and idle 10–11 hours, 4 unattached with no transcript, and 0 where claude had exited. So what
+  accumulates is live agent processes nobody is attached to, and the issue's own proposal
+  (`cleanup-orphans` at boot) would reap 4 of those 21 — none of them the 5.
+
+### Changed
+
+- **Four `jscpd/duplicate-code` alerts closed by extracting shared helpers** ([#1473](https://github.com/receptron/mulmoterminal/pull/1473), refs [#1472](https://github.com/receptron/mulmoterminal/issues/1472); follow-up comment in [#1475](https://github.com/receptron/mulmoterminal/pull/1475)).
+  Behaviour is unchanged. All four alerts had the same cause — something added later copied the
+  same-shaped code next to it, `icon` from `sound` and grok from antigravity — and the real bug is
+  the drift where only the copy gets fixed, which is exactly how #1441 happened. So the copies were
+  merged into shared helpers (`resolveFileWithinDir`, `liveSessionFacts` / `resolveResumableSession`,
+  `handleDirectoryMcpAgentConnection`, `startDirectoryMcpPty`) rather than deleted, making it
+  impossible to fix one side alone.
+
+- **`@mulmoclaude/core` 2.1.0 and `@mulmoclaude/markdown-plugin` 2.3.0** ([#1477](https://github.com/receptron/mulmoterminal/pull/1477)).
+  Dependency bump only, no source changes. It also removed a second copy of `core`: the other
+  plugins declare `^2.0.0` / `^2.0.1` and yarn 1 does not dedupe those onto a newer resolution, so
+  2.0.1 was being installed beside 2.1.0.
 
 ## mulmoterminal@4.5.1 — 2026-08-05
 
