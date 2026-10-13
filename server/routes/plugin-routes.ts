@@ -21,6 +21,7 @@ import { manageCollectionHandler } from "../infra/collection-tool.js";
 import { getCwdPresets, getRepoDirs } from "../config/config-routes.js";
 import { repoDirsFromPresets } from "../git/repo-dirs.js";
 import { upstreamFailureMessage } from "./plugin-narration.js";
+import { mountTaskRelayCapabilities } from "./task-relay-capabilities.js";
 import type { SpawnClaudePty, SpawnCodexPty, SpawnAntigravityPty, SpawnGrokPty } from "../session/spawners.js";
 
 export interface PluginRouteDeps {
@@ -65,6 +66,7 @@ async function spawnCwdFor(requested: string | undefined): ReturnType<typeof res
 }
 
 export function mountPluginRoutes(app: Express, deps: PluginRouteDeps): void {
+  mountTaskRelayCapabilities(app, spawnCwdFor);
   // Host tool: spawnBackgroundChat. Unlike a plugin (handled by mountAllRoutes'
   // catch-all), it needs server internals — it spawns a brand-new interactive Claude
   // terminal session, seeded with `message`, that the user can open from the sidebar.
@@ -131,7 +133,7 @@ export function mountPluginRoutes(app: Express, deps: PluginRouteDeps): void {
       console.error(`[spawnBackgroundChat] failed for ${sessionId}: ${messageOf(err)}`);
       return res.json({ message: `Failed to spawn a new session: ${messageOf(err)}` });
     }
-    return res.json({ message: backgroundChatMessage(agent, draft, sessionId), jsonData: { chatId: sessionId, agent } });
+    return res.json({ message: backgroundChatMessage(agent, draft, sessionId), jsonData: { chatId: sessionId, agent, cwd } });
   });
 
   // Host tool: manageAccounting. The accounting package exposes no gui-chat-protocol

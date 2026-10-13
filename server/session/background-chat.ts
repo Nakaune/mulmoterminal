@@ -26,6 +26,9 @@ export function parseBackgroundChat(body: unknown): { ok: true; request: Backgro
   const record: Record<string, unknown> = isRecord(body) ? body : {};
   const message = typeof record.message === "string" ? record.message.trim() : "";
   if (!message) return { ok: false, message: "spawnBackgroundChat: `message` is required (non-empty string)." };
+  if (record.cwd !== undefined && (typeof record.cwd !== "string" || !path.isAbsolute(record.cwd) || record.cwd.includes("\0"))) {
+    return { ok: false, message: "spawnBackgroundChat: `cwd` must be an absolute directory path." };
+  }
   return {
     ok: true,
     request: {
@@ -55,8 +58,8 @@ const isSameOrInside = (root: string, target: string): boolean => {
  *  on trust: it has to be an existing directory whose REAL path (symlinks resolved, so a link
  *  inside an allowed tree cannot lead out of it) is the default cwd, inside it, or one of the
  *  known clones, or inside one. Same stance as /api/issues/start, which only starts work in a
- *  clone the server resolved itself. On success the path comes back as the caller gave it
- *  (resolved to a normal form), not the realpath, so sessions keep the name the caller knows. */
+ *  clone the server resolved itself. On success it returns the canonical realpath so the
+ *  spawner and the caller's receipt identify the same directory. */
 export async function resolveSpawnCwd(cwd: string, allowedRoots: readonly string[]): Promise<{ ok: true; cwd: string } | { ok: false; message: string }> {
   const requested = path.resolve(cwd);
   const real = await realpathOrNull(requested);
@@ -74,7 +77,7 @@ export async function resolveSpawnCwd(cwd: string, allowedRoots: readonly string
       message: `spawnBackgroundChat: \`cwd\` ${cwd} is neither inside the server's default directory nor inside a known clone, so no session was started.`,
     };
   }
-  return { ok: true, cwd: requested };
+  return { ok: true, cwd: real };
 }
 
 export type SpawnMode = "claude-draft" | "claude-run" | "codex-run" | "antigravity-run" | "grok-run";
