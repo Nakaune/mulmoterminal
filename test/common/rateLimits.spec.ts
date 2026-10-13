@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseRateLimits, parseRateLimitWindow } from "../../common/rateLimits";
+import { parseRateLimits, parseRateLimitWindow, parseScopedRateLimitWindow } from "../../common/rateLimits";
 
 // The wire parser both sides run (#387). Its guards were hand-copied one-liners until #1074 moved
 // them to common/isRecord.ts and common/finiteNumber.ts — the shared `isRecord` REJECTS arrays
@@ -49,5 +49,55 @@ describe("parseRateLimits", () => {
       fiveHour: { usedPercentage: 7, resetsAt_sec: null },
       sevenDay: null,
     });
+  });
+
+  it("reads the per-model windows", () => {
+    expect(parseRateLimits({ fiveHour: null, sevenDay: { usedPercentage: 46 }, scoped: [{ label: "fable", usedPercentage: 74 }] })).toEqual({
+      fiveHour: null,
+      sevenDay: { usedPercentage: 46, resetsAt_sec: null },
+      scoped: [{ label: "fable", usedPercentage: 74, resetsAt_sec: null }],
+    });
+  });
+
+  // The account windows and the per-model ones are separately nullable upstream. Dropping a 74%
+  // because the pair beside it was absent is the same mistake as rendering an absent window as 0.
+  it("keeps a reading that is only per-model windows", () => {
+    expect(parseRateLimits({ scoped: [{ label: "fable", usedPercentage: 74 }] })?.scoped).toHaveLength(1);
+  });
+
+  // A reading written before scoped windows existed, read back out of the cache file.
+  it("leaves scoped absent rather than empty when there are none", () => {
+    expect(parseRateLimits({ fiveHour: { usedPercentage: 7 }, sevenDay: null })).not.toHaveProperty("scoped");
+  });
+
+  it("drops an unusable scoped entry without losing the rest", () => {
+    expect(parseRateLimits({ fiveHour: null, sevenDay: null, scoped: [{ usedPercentage: 74 }, { label: "fable", usedPercentage: 74 }] })?.scoped).toEqual([
+      { label: "fable", usedPercentage: 74, resetsAt_sec: null },
+    ]);
+  });
+
+  it("is null when scoped is the only field and holds nothing usable", () => {
+    expect(parseRateLimits({ scoped: [{ label: "fable" }] })).toBeNull();
+  });
+});
+
+// The label IS the information — a per-model window with no name says nothing a 7d does not.
+describe("parseScopedRateLimitWindow", () => {
+  it("keeps the label alongside the window", () => {
+    expect(parseScopedRateLimitWindow({ label: "fable", usedPercentage: 74, resetsAt_sec: 1789110000 })).toEqual({
+      label: "fable",
+      usedPercentage: 74,
+      resetsAt_sec: 1789110000,
+    });
+  });
+
+  it.each([
+    ["no label", { usedPercentage: 74 }],
+    ["a blank label", { label: "  ", usedPercentage: 74 }],
+    ["a label that is not a string", { label: 5, usedPercentage: 74 }],
+    ["no percentage", { label: "fable" }],
+    ["null", null],
+  ])("is null for %s", (_case, raw) => {
+    expect(parseScopedRateLimitWindow(raw)).toBeNull();
   });
 });

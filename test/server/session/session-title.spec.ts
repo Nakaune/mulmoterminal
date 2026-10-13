@@ -4,6 +4,8 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { ConversationTurn } from "../../../server/session/transcript.js";
+import * as codexSummary from "../../../server/session/codex-summary.js";
+import * as codexSessions from "../../../server/agents/codex-sessions.js";
 import { createTitleManager } from "../../../server/session/session-title.js";
 import {
   aiTitles,
@@ -310,5 +312,24 @@ describe("freshenRosterTitle", () => {
     titleInFlight.add(SESSION);
     freshenRosterTitle(SESSION, cwd, 99);
     expect(lastTitleAttemptMs.has(SESSION)).toBe(false);
+  });
+});
+
+describe("Codex bounded title input", () => {
+  it("records the full user-turn count, so a five-turn window does not trigger endless retitling", async () => {
+    vi.spyOn(codexSessions, "codexRolloutPath").mockReturnValue("/unused-rollout");
+    vi.spyOn(codexSummary, "readCodexSummary").mockResolvedValue({
+      lastPrompt: "latest",
+      lastResponse: "done",
+      userTurns: 100,
+      lastComplete: { prompt: "latest", reply: "done" },
+      titleTurns: Array.from({ length: 5 }, (_, i) => ({ role: "user" as const, text: `task ${i}` })),
+    });
+    const mgr = setup();
+    mgr.noteTitleTurn(SESSION, "a useful task");
+    await mgr.maybeGenerateTitle(SESSION, cwd, "codex");
+    expect(lastTitledUserTurns.get(SESSION)).toBe(100);
+    mgr.freshenRosterTitle(SESSION, cwd, 100, "codex");
+    expect(mgr.summarized).toHaveLength(1);
   });
 });

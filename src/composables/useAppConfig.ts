@@ -4,6 +4,7 @@ import type { Launcher } from "../components/launchers";
 import { isCustomAgent, type CustomAgent } from "../../common/customAgents";
 import type { UserMcpServer } from "../components/userMcp";
 import type { QuickCommand } from "../../common/quickCommands";
+import { isToolbarLink, type ToolbarLink } from "../../common/toolbarLinks";
 import { isPushKind, type PushKind } from "../../common/pushKinds";
 import { DEFAULT_SOUND_KINDS, isNotifyKind, type NotifyKind } from "../../common/notifyKinds";
 import { isRecord } from "../../common/isRecord";
@@ -70,6 +71,10 @@ function adoptSoundConfig(c: Record<string, unknown>): void {
 // unshortened. Found by looking at a screenshot of the issue rows' clone menu.
 const home = ref<string | null>(null);
 
+/** The server's home directory, for a reader outside the composable — null until the config
+ *  has loaded. Same shape as `currentSoundConfig` above. */
+export const currentHome = (): string | null => home.value;
+
 const prRepos = ref<string[]>([]);
 
 // The hosts declared as self-hosted GitLab (#1332). The browser needs it to know that a
@@ -104,6 +109,9 @@ const userMcpServers = ref<UserMcpServer[]>([]);
 // The phrases the phone offers as chips on a session (#830) — SINGLETON like the others, so
 // the settings editor and any future in-app use read one list.
 const quickCommands = ref<QuickCommand[]>([]);
+// Read-only, unlike the lists above it: the settings UI does not edit these, so there is no
+// setter and no POST — config.json (or a POST to /api/config) is where they are named.
+const toolbarLinks = ref<ToolbarLink[]>([]);
 
 // Pre-#163 recent dirs lived in localStorage (the removed useRecentDirs). They are
 // imported once into the server-side preset list on load — see migrateLegacyRecents.
@@ -313,6 +321,7 @@ function adoptListConfig(c: Record<string, unknown>): void {
   launchers.value = listOf(c.launchers, isLauncher);
   customAgents.value = listOf(c.customAgents, isCustomAgent);
   quickCommands.value = listOf(c.quickCommands, isQuickCommand);
+  toolbarLinks.value = listOf(c.toolbarLinks, isToolbarLink);
   userMcpServers.value = listOf(c.userMcpServers, isUserMcpServer);
 }
 
@@ -438,6 +447,7 @@ export function useAppConfig() {
     launchers,
     customAgents,
     quickCommands,
+    toolbarLinks,
     userMcpServers,
     ...soundSettings,
     pushEnabled,

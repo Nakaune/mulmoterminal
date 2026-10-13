@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mount, flushPromises } from "@vue/test-utils";
 import { router } from "../../../src/router";
+import { setPhoneLayoutForTest } from "../../../src/composables/phoneLayout";
+import { GRID_STATE_CHANNEL } from "../../../common/gridStateSync";
 import { defineComponent, h, KeepAlive, type Component } from "vue";
 
 // App.vue renders GridView inside <KeepAlive>, and the grid registers its openers (new terminal,
@@ -872,6 +874,151 @@ describe("GridView launcher picks (#1114)", () => {
     const cells = w.findComponent(ShellLaunchStub).props("cells") as LauncherCell[];
     expect(cells[0].launcher).toEqual({ shell: true, label: "shell" });
     expect(cells[0].cwd).toBe("/proj");
+    w.unmount();
+  });
+});
+
+// The second screen. The grid arrangement is localStorage, which is per ORIGIN, so a phone
+// reaching this same server over the tunnel starts empty — and the unplaced sweep correctly finds
+// nothing, because every session is already placed in a grid the phone cannot see. Without a
+// second question to ask, a phone can only ever show sessions it started itself.
+describe("GridView (phone) adopts the machine's live sessions", () => {
+  const LIVE_A = "77777777-7777-7777-7777-777777777777";
+  const LIVE_B = "88888888-8888-8888-8888-888888888888";
+
+  const withFetch = (rows: Array<{ id: string; agent: string; cwd: string }>) => {
+    const asked: string[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (url: FetchUrl, init?: RequestInit) => {
+      const href = String(url);
+      if (href.includes("/api/sessions/live")) {
+        asked.push("live");
+        return { ok: true, json: async () => ({ sessions: rows }) } as Response;
+      }
+      if (href.includes("/api/sessions/unplaced")) {
+        asked.push("unplaced");
+        return { ok: true, json: async () => ({ sessions: [] }) } as Response;
+      }
+      return realFetch(url, init);
+    }) as typeof fetch;
+    return asked;
+  };
+
+  const mountGrid = () =>
+    mountActivated(GridView, {
+      global: { stubs: { TerminalGrid: CellsStub, AppToolbar: ToolbarStub, SettingsModal: SkillSettingsStub } },
+    });
+
+  afterEach(() => setPhoneLayoutForTest(1440));
+
+  it("takes every live session as a cell", async () => {
+    setPhoneLayoutForTest(390);
+    withFetch([
+      { id: LIVE_A, agent: "claude", cwd: "/one" },
+      { id: LIVE_B, agent: "codex", cwd: "/two" },
+    ]);
+    const w = mountGrid();
+    await flushPromises();
+
+    const cells = w.findComponent(CellsStub).props("cells") as Array<{ session: string | null; agent?: string; cwd?: string | null }>;
+    // Both of them, each in the directory its PTY actually runs in rather than this grid's default.
+    expect(cells.find((c) => c.session === LIVE_A)?.cwd).toBe("/one");
+    expect(cells.find((c) => c.session === LIVE_B)?.cwd).toBe("/two");
+    // The agent travels too, or the cell reconnects on the wrong endpoint (PR #1189). Only the
+    // non-default one is written down — sessionCell leaves `agent` off a claude cell.
+    expect(cells.find((c) => c.session === LIVE_B)?.agent).toBe("codex");
+    expect(cells.find((c) => c.session === LIVE_A)?.agent).toBeUndefined();
+    w.unmount();
+  });
+
+  // Doing this on the desktop would undo closing a cell — the next reload would take it straight
+  // back — so the wider layout must not even ask.
+  it("does not ask for them on the desktop", async () => {
+    setPhoneLayoutForTest(1440);
+    const asked = withFetch([{ id: LIVE_A, agent: "claude", cwd: "/one" }]);
+    const w = mountGrid();
+    await flushPromises();
+
+    expect(asked).not.toContain("live");
+    expect((w.findComponent(CellsStub).props("cells") as Array<{ session: string | null }>).some((c) => c.session === LIVE_A)).toBe(false);
+    w.unmount();
+  });
+
+  // The header is the app's, and the detail screen is the terminal's. 44 of 844 pixels spent on
+  // the app's own name plus four controls that belong to the list — with the way back already on
+  // screen just below, in the cell's own header (its ⤡ emits the same toggle-expand a roster row
+  // does). Still drawn on the LIST screen, which is the only place those controls exist at all.
+  it("drops the header once a session is open, and keeps it on the list", async () => {
+    setPhoneLayoutForTest(390);
+    withFetch([{ id: LIVE_A, agent: "claude", cwd: "/one" }]);
+    const w = mountGrid();
+    await flushPromises();
+    expect(w.findComponent(ToolbarStub).exists()).toBe(true);
+
+    await w.findComponent(CellsStub).vm.$emit("toggle-expand", w.findComponent(CellsStub).props("cells")[0].uid);
+    await flushPromises();
+    expect(w.findComponent(ToolbarStub).exists()).toBe(false);
+    w.unmount();
+  });
+
+  // The desktop keeps it in both states: the roster sits BESIDE the terminal there, so there is no
+  // "detail screen" to give the header's room back to.
+  it("keeps the header on the desktop while a session is open", async () => {
+    setPhoneLayoutForTest(1440);
+    withFetch([]);
+    const w = mountGrid();
+    await flushPromises();
+    await w.findComponent(CellsStub).vm.$emit("toggle-expand", w.findComponent(CellsStub).props("cells")[0].uid);
+    await flushPromises();
+    expect(w.findComponent(ToolbarStub).exists()).toBe(true);
+    w.unmount();
+  });
+
+  // One cell per session. Two would fight over its single socket — the server supersedes the
+  // older one, so the loser goes dead while still looking live.
+  it("does not take a session it already has", async () => {
+    setPhoneLayoutForTest(390);
+    withFetch([{ id: LIVE_A, agent: "claude", cwd: "/one" }]);
+    const w = mountGrid();
+    await flushPromises();
+    pubsub.push("sessions", { id: LIVE_A, working: false, event: "created" });
+    await flushPromises();
+
+    const cells = w.findComponent(CellsStub).props("cells") as Array<{ session: string | null }>;
+    expect(cells.filter((c) => c.session === LIVE_A)).toHaveLength(1);
+    w.unmount();
+  });
+});
+
+// The OTHER half of the second screen: the arrangement itself. Two browsers on the same machine
+// are different ORIGINS — the desktop's `localhost:34567` and an SSH forward's `127.0.0.1:34568`
+// — so each keeps its own localStorage grid and the two drift apart in order and paging even
+// when they show the same sessions. The shared snapshot is what makes them one grid.
+//
+// It is here rather than only in useSharedGridState.spec.ts because the composable is wired in by
+// ONE line in this component, and every other test in this file passes with that line deleted
+// (measured). A composable nothing calls is exactly the "types, lint and build all green, code
+// does nothing" shape this fork has shipped before.
+describe("GridView shares the arrangement across browsers", () => {
+  const SHARED = "99999999-9999-9999-9999-999999999999";
+
+  it("takes the arrangement a grid-state snapshot brings", async () => {
+    setPhoneLayoutForTest(1440);
+    const w = mountActivated(GridView, {
+      global: { stubs: { TerminalGrid: CellsStub, AppToolbar: ToolbarStub, SettingsModal: SkillSettingsStub } },
+    });
+    await flushPromises();
+
+    // What the server publishes when the other browser rearranges its grid.
+    pubsub.push(GRID_STATE_CHANNEL, {
+      revision: 7,
+      state: { cells: [{ uid: 0, session: SHARED, cwd: "/shared", launcher: null }], expanded: null, page: 0, sortMode: "manual" },
+      updatedBy: "the-other-browser",
+    });
+    await flushPromises();
+
+    const cells = w.findComponent(CellsStub).props("cells") as Array<{ session: string | null; cwd?: string | null }>;
+    expect(cells.find((c) => c.session === SHARED)?.cwd).toBe("/shared");
     w.unmount();
   });
 });

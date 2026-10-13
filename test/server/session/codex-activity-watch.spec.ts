@@ -5,6 +5,8 @@ import type { CodexTurnBoundary } from "../../../server/agents/codex-activity.js
 
 const line = (o: unknown) => JSON.stringify(o);
 const started = (turnId = "t1") => line({ type: "event_msg", payload: { type: "task_started", turn_id: turnId } }) + "\n";
+const execCwd = (cwd: string) =>
+  line({ type: "response_item", payload: { type: "custom_tool_call", name: "exec", input: `tools.exec_command({cmd:"pwd",workdir:"${cwd}"})` } }) + "\n";
 const complete = (turnId = "t1") => line({ type: "event_msg", payload: { type: "task_complete", turn_id: turnId, last_agent_message: "done" } }) + "\n";
 
 // A fake rollout the test appends to, driving the loop one tick at a time. `sleep`
@@ -14,6 +16,7 @@ function harness(initial: string, startAtEnd: boolean) {
   let ticks = 0;
   const maxTicks = 12;
   const boundaries: CodexTurnBoundary[] = [];
+  const initialBoundaries: CodexTurnBoundary[] = [];
   const appendAtTick: Map<number, string> = new Map();
   let missing = false;
 
@@ -21,6 +24,7 @@ function harness(initial: string, startAtEnd: boolean) {
     fileSize: async () => (missing ? null : Buffer.byteLength(content)),
     readSlice: async (from, to) => Buffer.from(content).subarray(from, to).toString(),
     onBoundary: (b) => boundaries.push(b),
+    onInitialBoundary: (b) => initialBoundaries.push(b),
     isAlive: () => ticks < maxTicks,
     startAtEnd,
     sleep: async () => {
@@ -32,6 +36,7 @@ function harness(initial: string, startAtEnd: boolean) {
   return {
     deps,
     boundaries,
+    initialBoundaries,
     appendAt: (tick: number, text: string) => appendAtTick.set(tick, text),
     setMissing: (v: boolean) => (missing = v),
     run: () => watchCodexActivity(deps),
@@ -47,6 +52,36 @@ describe("watchCodexActivity", () => {
     expect(h.boundaries).toEqual(["started", "completed"]);
   });
 
+  it("reports cwd from appended turn_context rows", async () => {
+    const h = harness("", false);
+    const cwds: string[] = [];
+    h.deps.onCwd = (cwd) => cwds.push(cwd);
+    h.appendAt(1, execCwd("/work"));
+    await h.run();
+    expect(cwds).toEqual(["/work"]);
+  });
+
+  it("joins a turn_context record split across polls", async () => {
+    const h = harness("", false);
+    const cwds: string[] = [];
+    h.deps.onCwd = (cwd) => cwds.push(cwd);
+    const whole = execCwd("/split");
+    h.appendAt(1, whole.slice(0, 18));
+    h.appendAt(2, whole.slice(18));
+    await h.run();
+    expect(cwds).toEqual(["/split"]);
+  });
+
+  it("does not replay resumed cwd history, but reports new cwd rows", async () => {
+    const old = execCwd("/old");
+    const h = harness(old, true);
+    const cwds: string[] = [];
+    h.deps.onCwd = (cwd) => cwds.push(cwd);
+    h.appendAt(2, execCwd("/new"));
+    await h.run();
+    expect(cwds).toEqual(["/old", "/new"]);
+  });
+
   it("reads a fresh session's existing content, so its first turn isn't missed", async () => {
     const h = harness(started(), false);
     await h.run();
@@ -59,6 +94,14 @@ describe("watchCodexActivity", () => {
     const h = harness(started("old") + complete("old"), true);
     await h.run();
     expect(h.boundaries).toEqual([]);
+    expect(h.initialBoundaries).toEqual(["completed"]);
+  });
+
+  it("reports only the latest resumed started boundary as initial state", async () => {
+    const h = harness(started("old") + complete("old") + started("new"), true);
+    await h.run();
+    expect(h.boundaries).toEqual([]);
+    expect(h.initialBoundaries).toEqual(["started"]);
   });
 
   it("still reports a resumed session's NEW turns", async () => {

@@ -17,6 +17,8 @@ interface PhaseDisplay {
 }
 const DISPLAY: Record<Exclude<PrPhase, "none">, PhaseDisplay> = {
   draft: { label: "draft", title: "Draft PR", state: "draft" },
+  // 「直すのは CI ではなく枝」だと分かる語にする。conflict という 1 語がそれを言う。
+  conflict: { label: "conflict", title: "PR — merge conflict", state: "merge conflict" },
   "ci-failing": { label: "CI fail", title: "PR — CI failing", state: "CI failing" },
   "changes-requested": { label: "changes", title: "PR — changes requested", state: "changes requested" },
   "ci-running": { label: "CI…", title: "PR — CI running", state: "CI running" },

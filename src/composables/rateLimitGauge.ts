@@ -81,9 +81,14 @@ const expired = (window: RateLimitWindow, now_ms: number): boolean => window.res
  *  had deliberately dropped (Codex review on #1047). */
 const liveWindows = (limits: RateLimits | null, now_ms: number): { label: string; window: RateLimitWindow }[] => {
   if (!limits) return [];
+  // The account's own windows first, then the per-model ones, because that is the order the
+  // question is asked in: how much of my week is gone, and then which model spent it. The scoped
+  // labels are the server's own words (`fable`), so nothing here has a list of models to keep up
+  // to date.
   const labelled = [
     { label: "5h", window: limits.fiveHour },
     { label: "7d", window: limits.sevenDay },
+    ...(limits.scoped ?? []).map((window) => ({ label: window.label, window })),
   ];
   return labelled.flatMap(({ label, window }) => (window !== null && !expired(window, now_ms) ? [{ label, window }] : []));
 };

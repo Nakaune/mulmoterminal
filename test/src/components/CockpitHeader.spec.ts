@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { mount } from "@vue/test-utils";
 import CockpitHeader from "../../../src/components/CockpitHeader.vue";
 import type { AttentionStatus } from "../../../src/components/attentionStatus";
@@ -13,6 +13,9 @@ type Props = {
   headerTextColor: string | null;
   workPhase?: WorkPhase | null;
   phase?: PrPhase;
+  pr?: number | null;
+  prUrl?: string | null;
+  reviewPending?: boolean;
   dirLength?: number;
 };
 const base: Props = { status: "idle", agent: "claude", cwd: "/home/me/proj", home: "/home/me", headerColor: null, headerTextColor: null };
@@ -38,9 +41,34 @@ describe("CockpitHeader", () => {
     expect(badge(mountH({ status: "working", workPhase: "planning" }))).toBe("planning");
   });
 
+  it("uses the planning tone and shows the user-owned review marker", () => {
+    const planning = mountH({ status: "working", workPhase: "planning", reviewPending: true });
+    expect(planning.get('[data-testid="cockpit-badge"]').classes()).toContain("bg-[#22d3ee]");
+    expect(planning.get('[data-testid="cockpit-review"]').text()).toBe("review");
+    expect(mountH({ reviewPending: false }).find('[data-testid="cockpit-review"]').exists()).toBe(false);
+  });
+
   it("shows the PR phase pill only when there is a phase", () => {
     expect(mountH({ phase: "none" }).find('[data-testid="cockpit-phase"]').exists()).toBe(false);
     expect(mountH({ phase: "ready" }).find('[data-testid="cockpit-phase"]').exists()).toBe(true);
+  });
+
+  it("shows a clickable PR number, including merged work, and omits unknown PRs", async () => {
+    const w = mountH({ pr: 977, prUrl: "https://github.com/acme/repo/pull/977", phase: "merged" });
+    const link = w.get('[data-testid="cockpit-pr"]');
+    expect(link.text()).toBe("#977");
+    expect(link.attributes("href")).toBe("https://github.com/acme/repo/pull/977");
+    const bubble = new MouseEvent("click", { bubbles: true, cancelable: true });
+    const parentClick = vi.fn();
+    w.element.addEventListener("click", parentClick);
+    link.element.dispatchEvent(bubble);
+    expect(parentClick).not.toHaveBeenCalled();
+    await w.setProps({ pr: 978, prUrl: "https://github.com/acme/repo/pull/978", phase: "closed" });
+    expect(w.get('[data-testid="cockpit-pr"]').text()).toBe("#978");
+    expect(w.get('[data-testid="cockpit-pr"]').attributes("href")).toContain("/978");
+    await w.setProps({ pr: null, prUrl: null, phase: "none" });
+    expect(w.find('[data-testid="cockpit-pr"]').exists()).toBe(false);
+    expect(mountH({ pr: null }).find('[data-testid="cockpit-pr"]').exists()).toBe(false);
   });
 
   it("tags codex cells and not claude ones", () => {

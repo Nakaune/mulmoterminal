@@ -56,8 +56,13 @@ export function messageEffect(type: string | undefined, isCommand: boolean, erro
   switch (type) {
     case "exit":
       return { terminal: true, callsOnExit: true, banner: exitBanner(isCommand, exitCode) };
+    // Names the way back, because there is one and nothing else says so. The server allows a
+    // session ONE client and hands it to the newest (pty-connection.ts), so a phone opening the
+    // grid takes every cell the desktop was holding — and the desktop is then looking at a banner
+    // with no control that does anything. Reloading reconnects, which supersedes in the other
+    // direction; that is the whole handover mechanism, and it was invisible.
     case "superseded":
-      return { terminal: true, callsOnExit: false, banner: line(GREEN, "[detached — this session is open in another window]") };
+      return { terminal: true, callsOnExit: false, banner: line(GREEN, "[detached — taken by another window · reload this page to take it back]") };
     case "error": {
       const detail = typeof errorMessage === "string" ? errorMessage : "failed to start";
       return { terminal: true, callsOnExit: true, banner: line(RED, `[${detail}]`) };

@@ -1,6 +1,14 @@
 // @vitest-environment node
 import { describe, it, expect } from "vitest";
-import { reapDecisionFor, reapTimerDelay, parseWaitGraceMs, MAX_TIMER_MS, shouldForgetActivity } from "../../../server/session/reap-policy.js";
+import {
+  reapDecisionFor,
+  reapTimerDelay,
+  parseWaitGraceMs,
+  MAX_TIMER_MS,
+  shouldForgetActivity,
+  isConnectionDrop,
+  ABNORMAL_CLOSURE,
+} from "../../../server/session/reap-policy.js";
 
 const graces = { idleMs: 30_000, waitingMs: 1_800_000 };
 
@@ -35,6 +43,47 @@ describe("reapDecisionFor", () => {
   // decision just passes the value through rather than second-guessing it.
   it("passes a disabled (zero) waiting grace straight through", () => {
     expect(reapDecisionFor({ waiting: true }, { idleMs: 30_000, waitingMs: 0 })).toEqual({ kind: "arm", delayMs: 0 });
+  });
+
+  // A browser on another machine loses its socket every time the network does. Reaping on
+  // that is how an agent left running on a remote PC died 30 seconds after the connection
+  // went, while the same session opened over loopback survived for days.
+  it("keeps a session whose connection dropped instead of closing", () => {
+    expect(reapDecisionFor({ working: false, waiting: false }, graces, { connectionDropped: true })).toEqual({ kind: "keep" });
+  });
+
+  it("keeps one that needs the user when the connection dropped, rather than timing it out", () => {
+    // The long grace is for someone who can come back and answer. Cut off, they may not be
+    // able to for hours, and the question is exactly what must not be thrown away.
+    expect(reapDecisionFor({ waiting: true }, graces, { connectionDropped: true })).toEqual({ kind: "keep" });
+  });
+
+  it("still reaps on a deliberate close", () => {
+    // The whole point of splitting the two: closing a cell must go on working as before.
+    expect(reapDecisionFor({ waiting: false }, graces, { connectionDropped: false })).toEqual({ kind: "arm", delayMs: 30_000 });
+    expect(reapDecisionFor({ waiting: true }, graces, {})).toEqual({ kind: "arm", delayMs: 1_800_000 });
+  });
+});
+
+// Which close codes mean "the connection broke". Reading this wrong either reaps a session
+// the network took away, or never reaps one the user closed on purpose.
+describe("isConnectionDrop", () => {
+  it("counts the abnormal closure `ws` invents when no close frame arrived", () => {
+    expect(ABNORMAL_CLOSURE).toBe(1006);
+    expect(isConnectionDrop(1006)).toBe(true);
+  });
+
+  it("does not count a close the client actually sent", () => {
+    expect(isConnectionDrop(1000)).toBe(false); // normal close — the cell was closed
+    expect(isConnectionDrop(1001)).toBe(false); // going away — the tab or page went
+    expect(isConnectionDrop(1005)).toBe(false); // a close frame that carried no code
+  });
+
+  it("treats a missing code as deliberate", () => {
+    // Every in-process caller that closes a socket itself has no code to give; reading
+    // that as a drop would switch auto-reaping off for reasons that have nothing to do
+    // with the network.
+    expect(isConnectionDrop(undefined)).toBe(false);
   });
 });
 

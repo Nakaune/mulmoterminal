@@ -1,6 +1,13 @@
 // @vitest-environment node
 import { describe, it, expect } from "vitest";
-import { lastTurnFromClaudeJsonl, lastTurnFromClaudeParsed, lastTurnFromCodexRollout, EMPTY_TURN } from "../../../server/session/last-turn.js";
+import {
+  conversationTurnsFromCodexParsed,
+  latestCodexPromptFromParsed,
+  lastTurnFromClaudeJsonl,
+  lastTurnFromClaudeParsed,
+  lastTurnFromCodexRollout,
+  EMPTY_TURN,
+} from "../../../server/session/last-turn.js";
 import { parseJsonl } from "../../../server/session/transcript.js";
 
 const line = (o: unknown) => JSON.stringify(o);
@@ -13,6 +20,10 @@ const toolUse = (name: string) => line({ type: "assistant", message: { content: 
 const started = (turnId: string) => line({ type: "event_msg", payload: { type: "task_started", turn_id: turnId } });
 const turnContext = (turnId: string) => line({ type: "turn_context", payload: { turn_id: turnId, cwd: "/w" } });
 const userMessage = (message: string) => line({ type: "event_msg", payload: { type: "user_message", message } });
+const responseItemUserMessage = (message: string) =>
+  line({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: message }] } });
+const injectedEnvironment = () => responseItemUserMessage("<environment_context>generated context</environment_context>");
+const injectedAgents = () => responseItemUserMessage("# AGENTS.md instructions for /work\nGenerated instructions");
 const agentMessage = (message: string) => line({ type: "event_msg", payload: { type: "agent_message", message } });
 const complete = (turnId: string, lastAgentMessage: string) =>
   line({ type: "event_msg", payload: { type: "task_complete", turn_id: turnId, last_agent_message: lastAgentMessage } });
@@ -52,6 +63,15 @@ describe("lastTurnFromClaudeParsed", () => {
 });
 
 describe("lastTurnFromCodexRollout", () => {
+  it("exposes the newest prompt while its turn is still running", () => {
+    const docs = parseJsonl([started("t1"), userMessage("first"), complete("t1", "answer"), started("t2"), userMessage("second, running")].join("\n"));
+    expect(latestCodexPromptFromParsed(docs)).toBe("second, running");
+    expect(conversationTurnsFromCodexParsed(docs)).toEqual([
+      { role: "user", text: "first" },
+      { role: "assistant", text: "answer" },
+      { role: "user", text: "second, running" },
+    ]);
+  });
   it("takes the last completed turn's prompt and its whole final message", () => {
     const raw = [
       started("t1"),
@@ -65,6 +85,35 @@ describe("lastTurnFromCodexRollout", () => {
       complete("t2", "second answer\nwith a second line"),
     ].join("\n");
     expect(lastTurnFromCodexRollout(raw)).toEqual({ prompt: "second", reply: "second answer\nwith a second line" });
+  });
+
+  it("reads the current response_item user format and skips injected startup context", () => {
+    const bundledStartupContext = line({
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "user",
+        content: [
+          { type: "input_text", text: "<recommended_plugins>generated plugins</recommended_plugins>" },
+          { type: "input_text", text: "must not become the prompt" },
+        ],
+      },
+    });
+    const raw = [
+      injectedAgents(),
+      injectedEnvironment(),
+      bundledStartupContext,
+      started("t1"),
+      responseItemUserMessage("repair the display"),
+      complete("t1", "done"),
+    ].join("\n");
+    const docs = parseJsonl(raw);
+    expect(latestCodexPromptFromParsed(docs)).toBe("repair the display");
+    expect(conversationTurnsFromCodexParsed(docs)).toEqual([
+      { role: "user", text: "repair the display" },
+      { role: "assistant", text: "done" },
+    ]);
+    expect(lastTurnFromCodexRollout(raw)).toEqual({ prompt: "repair the display", reply: "done" });
   });
 
   it("falls back to the previous turn while the newest one is still running", () => {

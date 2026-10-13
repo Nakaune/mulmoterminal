@@ -49,6 +49,13 @@ describe("messageEffect", () => {
     expect(e.banner).toContain("another window");
   });
 
+  // The banner is the ONLY thing on screen when a phone takes the desktop's cells, and there is a
+  // way back — reloading reconnects, which supersedes in the other direction. Naming it is what
+  // turns a dead-looking cell into a handover the user can drive.
+  it("names the way back on superseded", () => {
+    expect(messageEffect("superseded", false).banner).toContain("reload");
+  });
+
   it("treats error as terminal and fires onExit", () => {
     const e = messageEffect("error", false, "claude not found");
     expect([e.terminal, e.callsOnExit]).toEqual([true, true]);

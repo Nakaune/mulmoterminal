@@ -97,6 +97,7 @@ const props = defineProps<
     initialCwd: string | null;
     // The persisted agent for this cell; absent (or "claude") resumes as a normal Claude session.
     initialAgent?: TerminalAgent | null | undefined;
+    reviewPending?: boolean;
     defaultCwd: string | null;
     presets: CwdPreset[];
     // Configured launch commands (shell/codex/…) offered next to Claude in this launcher.
@@ -115,13 +116,22 @@ const props = defineProps<
     reorderable?: boolean;
     // Set aside by the user (#992): sunk out of the way, still connected, still holding history.
     parked?: boolean;
+    // The narrow layout. The cell keeps ONE row of chrome there — the note, review-waiting, and
+    // the way back — and drops the terminal's own toolbar row below it. Together those two rows
+    // were 73 of 844 pixels, above a terminal that is the entire reason the screen is open; what
+    // they hold is either a pane that has nowhere to go on a phone or an action on a grid the
+    // phone is not arranging.
+    phone?: boolean;
   }
 >();
 const emit = defineEmits<
   GridCellEmits & {
     // `record-cwd`: auto-record a fresh launch's server-confirmed cwd as a preset.
     // `remove-preset`: drop a preset (its close button) from the shared list — value is the path.
-    (e: "session" | "cwd" | "record-cwd" | "remove-preset", value: string): void;
+    (e: "cwd" | "live-cwd" | "record-cwd" | "remove-preset", value: string): void;
+    // `session`: the id this terminal is attached to, with the id it was attached FOR (null for a
+    // fresh launch) so the grid can tell a server-minted id from a report that is simply stale.
+    (e: "session", id: string, prior: string | null): void;
     // `run` launches in THIS (empty) cell from the launcher; `runSpare` is the running
     // terminal's header menu, which must NOT replace the session — it runs in a new cell.
     (e: "run" | "runSpare", value: RunCommand): void;
@@ -129,6 +139,7 @@ const emit = defineEmits<
     (e: "launch", value: LaunchPick): void;
     // The agent chosen for this fresh launch, so the grid persists it.
     (e: "agent", value: TerminalAgent): void;
+    (e: "review-pending", value: boolean): void;
     // Set this cell aside, or bring it back. The grid owns the flag; this only asks.
     (e: "park", value: boolean): void;
   }
@@ -514,6 +525,26 @@ function resumeSession({ id, cwd: dir, agent: resumeAgent }: { id: string; cwd: 
   void loadDiff(); // an already-idle worktree session shows its badge right away
 }
 
+// The cell can change session under this component: the shared grid adopts another browser's
+// snapshot, and a cell keyed by this uid may now hold a different session than the one this
+// terminal is attached to. Follow the cell — the same in-slot switch the resume list performs —
+// instead of keeping a connection to a session the grid has moved elsewhere. Null is not a switch:
+// the grid clears a session only when it is closing or relaunching the cell, which it handles.
+//
+// The agent comes along, read off the cell at the same moment. The session moved into this cell
+// is whatever it is — a claude conversation under a cell whose picker still says codex — and the
+// picker alone chose the endpoint. Following the id but not the agent connected `/ws/codex` with
+// claude's id; the server now refuses that and mints a fresh codex session, which the grid then
+// rejects as a stale report (setReportedSession), leaving the cell showing one session and holding
+// another. The cell's own `agent` field moved with the session, so it is the right answer here.
+watch(
+  () => props.initialSessionId,
+  (next) => {
+    if (next === null || next === sessionId.value) return;
+    resumeSession({ id: next, cwd: cwd.value, agent: asTerminalAgent(props.initialAgent) });
+  },
+);
+
 // Reveal this cell's working directory in the OS file manager. The browser can't
 // open a folder, but the local server can (POST /api/open-dir).
 async function openDir() {
@@ -546,6 +577,10 @@ function onServerCwd(c: string) {
     emit("record-cwd", c);
   }
   emit("cwd", c);
+}
+function onLiveCwd(c: string) {
+  cwd.value = c;
+  emit("live-cwd", c);
 }
 
 // "Open on GitHub": when this cell's dir is a GitHub repo, the server returns its
@@ -852,8 +887,9 @@ onUnmounted(() => document.removeEventListener("keydown", onCloseKey));
 // Adopt the server-assigned id (esp. for new sessions), bubble it up for
 // persistence, and load its initial activity.
 function onSession(id: string) {
+  const prior = sessionId.value;
   sessionId.value = id;
-  emit("session", id);
+  emit("session", id, prior);
   void loadInitial(id);
 }
 
@@ -986,7 +1022,7 @@ async function saveMemo() {
 
 // Per-cell token usage badge: ⇡ total input (fresh + cache) · ⇣ output generated.
 const usageView = computed(() => usageBadge(usage.value));
-const showUsage = computed(() => usageView.value.show);
+const showUsage = computed(() => agent.value !== "claude" && agent.value !== "codex" && usageView.value.show);
 const usageLabel = computed(() => usageView.value.label);
 const usageTitle = computed(() =>
   usage.value
@@ -1166,10 +1202,29 @@ onUnmounted(() => document.removeEventListener("keydown", onDiffKey));
           :home="home"
           :header-color="dirConfig.headerColor"
           :header-text-color="dirConfig.headerTextColor"
+          :review-pending="reviewPending"
           :icon-url="dirConfig.iconUrl"
+          :phase="workItem.phase"
+          :pr="workItem.pr"
+          :pr-url="workItem.prUrl"
           @click="onHeaderClick"
         >
           <span class="cell-actions" :class="CELL_ACTIONS">
+            <button
+              v-if="sessionId"
+              type="button"
+              data-testid="cell-review-toggle"
+              class="cell-btn"
+              :class="CELL_BTN"
+              :title="reviewPending ? 'Clear review waiting' : 'Mark as review waiting'"
+              :aria-label="reviewPending ? 'Clear review waiting' : 'Mark as review waiting'"
+              :aria-pressed="!!reviewPending"
+              @click.stop="emit('review-pending', !reviewPending)"
+            >
+              <span class="material-symbols-outlined text-[17px] leading-none" aria-hidden="true">{{
+                reviewPending ? "check_box" : "check_box_outline_blank"
+              }}</span>
+            </button>
             <CellChromeButtons v-bind="chromeProps" :parked="parked" v-on="chromeEvents" @toggle-park="togglePark" />
           </span>
         </CockpitHeader>
@@ -1210,6 +1265,13 @@ onUnmounted(() => document.removeEventListener("keydown", onDiffKey));
                thumbnail, leaving only dir + what it's doing + a zoom button. -->
             <template v-if="!filmstrip">
               <DirBadge :name="dirConfig.name" :color="dirConfig.badgeColor" :workspace="isWorkspace" />
+              <span
+                v-if="reviewPending"
+                data-testid="cell-review-badge"
+                class="flex-none whitespace-nowrap rounded-full border border-amber px-1.5 py-px text-[10px] font-bold text-warn"
+                title="This terminal is marked for review"
+                >review</span
+              >
               <!-- Unread Canvas output. Same chip vocabulary as the branch / context / token
                    chips beside it, deliberately: this is one more thing to triage at a glance,
                    not a new kind of alert. Clicking expands the cell with the pane open. -->
@@ -1320,10 +1382,32 @@ onUnmounted(() => document.removeEventListener("keydown", onDiffKey));
              order the command and launcher cells already use (CellShell). No `.stop`:
              shouldZoomOnHeaderClick already ignores a click inside a button. -->
           <span class="cell-actions" :class="CELL_ACTIONS">
-            <button v-if="reorderable" class="cell-btn" :class="CELL_BTN" title="Move left" aria-label="Move terminal left" @click="emit('move', -1)">
+            <button
+              v-if="sessionId"
+              type="button"
+              data-testid="cell-review-toggle"
+              class="cell-btn"
+              :class="CELL_BTN"
+              :title="reviewPending ? 'Clear review waiting' : 'Mark as review waiting'"
+              :aria-label="reviewPending ? 'Clear review waiting' : 'Mark as review waiting'"
+              :aria-pressed="!!reviewPending"
+              @click.stop="emit('review-pending', !reviewPending)"
+            >
+              <span class="material-symbols-outlined text-[17px] leading-none" aria-hidden="true">{{
+                reviewPending ? "check_box" : "check_box_outline_blank"
+              }}</span>
+            </button>
+            <button v-if="reorderable && !phone" class="cell-btn" :class="CELL_BTN" title="Move left" aria-label="Move terminal left" @click="emit('move', -1)">
               <span class="material-symbols-outlined" aria-hidden="true">chevron_left</span>
             </button>
-            <button v-if="reorderable" class="cell-btn" :class="CELL_BTN" title="Move right" aria-label="Move terminal right" @click="emit('move', 1)">
+            <button
+              v-if="reorderable && !phone"
+              class="cell-btn"
+              :class="CELL_BTN"
+              title="Move right"
+              aria-label="Move terminal right"
+              @click="emit('move', 1)"
+            >
               <span class="material-symbols-outlined" aria-hidden="true">chevron_right</span>
             </button>
             <CellChromeButtons v-bind="chromeProps" :parked="parked" v-on="chromeEvents" @toggle-park="togglePark" />
@@ -1341,7 +1425,7 @@ onUnmounted(() => document.removeEventListener("keydown", onDiffKey));
           :agent="agent"
           :custom-agent="customAgentId"
           :launch="launchChoice"
-          :hide-header="filmstrip"
+          :hide-header="filmstrip || phone"
           :expanded="expanded"
           :zoomed="zoomed"
           dev-terminal
@@ -1349,6 +1433,7 @@ onUnmounted(() => document.removeEventListener("keydown", onDiffKey));
           @session="onSession"
           @input="onTerminalInput"
           @cwd="onServerCwd"
+          @live-cwd="onLiveCwd"
           @run="(cmd) => emit('runSpare', cmd)"
         >
           <!-- Row 2 — actions on the SESSION, gathered onto the terminal's header row beside the

@@ -88,7 +88,26 @@ describe("pickFreshSession", () => {
   it("attributes a single fresh rollout (unambiguous)", () => {
     const before = snapshotSessions(root);
     writeRollout(root, UUID_A, "/a");
-    expect(pickFreshSession(root, before, "/anything")?.id).toBe(UUID_A);
+    expect(pickFreshSession(root, before, "/a")?.id).toBe(UUID_A);
+    expect(pickFreshSession(root, before, "/unrelated")).toBeNull();
+  });
+  it("attributes the interactive rollout when a guardian starts in the same directory", () => {
+    const before = snapshotSessions(root);
+    writeRollout(root, UUID_A, "/same");
+    const guardian = writeRollout(root, UUID_B, "/same");
+    writeFileSync(
+      guardian,
+      JSON.stringify({
+        type: "session_meta",
+        payload: {
+          id: UUID_B,
+          cwd: "/same",
+          source: { subagent: { other: "guardian" } },
+        },
+      }) + "\n",
+    );
+    expect(pickFreshSession(root, before, "/same")?.id).toBe(UUID_A);
+    expect(pickFreshSession(root, before, "/same", new Set([path.join(todayDir(root), `rollout-x-${UUID_A}.jsonl`)]))).toBeNull();
   });
   it("attributes the unique cwd match when several are fresh", () => {
     const before = snapshotSessions(root);

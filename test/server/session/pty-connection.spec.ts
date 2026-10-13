@@ -426,6 +426,18 @@ describe("reattachPty", () => {
   });
 });
 
+describe("reattach after a dropped connection", () => {
+  // The mark has to come off, or one blip would exempt the session from reaping for the
+  // rest of its life — including after the user closes the cell and opens it again.
+  it("clears the drop mark when someone reattaches", () => {
+    const { reattachPty } = setup();
+    const fresh = fakeSocket();
+    const entry = entryWith({ ws: null, buffer: "", connectionDropped: true });
+    reattachPty(entry, fresh.ws as never, SESSION);
+    expect(entry.connectionDropped).toBe(false);
+  });
+});
+
 describe("handleClientClose", () => {
   it("detaches the socket and arms the reap", () => {
     const { handleClientClose, calls } = setup();
@@ -452,6 +464,32 @@ describe("handleClientClose", () => {
     const entry = entryWith({ ws: s.ws as never, active: true });
     handleClientClose(entry, s.ws as never, SESSION);
     expect(entry.active).toBe(false);
+  });
+
+  // #1006-vs-1000 (see reap-policy): the close code is the only evidence of WHY the socket
+  // went, and it is gone by the time the reap is re-armed, so the entry has to carry it.
+  it("marks the entry when the socket broke instead of closing", () => {
+    const { handleClientClose } = setup();
+    const s = fakeSocket();
+    const entry = entryWith({ ws: s.ws as never });
+    handleClientClose(entry, s.ws as never, SESSION, 1006);
+    expect(entry.connectionDropped).toBe(true);
+  });
+
+  it("leaves it unmarked for a close the client asked for", () => {
+    const { handleClientClose } = setup();
+    const s = fakeSocket();
+    const entry = entryWith({ ws: s.ws as never });
+    handleClientClose(entry, s.ws as never, SESSION, 1000);
+    expect(entry.connectionDropped).toBe(false);
+  });
+
+  it("leaves it unmarked when no code came at all", () => {
+    const { handleClientClose } = setup();
+    const s = fakeSocket();
+    const entry = entryWith({ ws: s.ws as never });
+    handleClientClose(entry, s.ws as never, SESSION);
+    expect(entry.connectionDropped).toBe(false);
   });
 
   it("ignores the close of a socket a newer client already replaced", () => {

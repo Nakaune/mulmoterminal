@@ -25,6 +25,22 @@ describe("gaugeWindows", () => {
     expect(gaugeWindows(null, NOW)).toEqual([]);
   });
 
+  // The "Current week (Fable)" row, after the account's own two: how much of my week is gone,
+  // then which model spent it.
+  it("shows the per-model windows after the account's own", () => {
+    expect(gaugeWindows({ fiveHour: window(9), sevenDay: window(45), scoped: [{ label: "fable", usedPercentage: 74, resetsAt_sec: null }] }, NOW)).toEqual([
+      { label: "5h", percent: 9, warn: false },
+      { label: "7d", percent: 45, warn: false },
+      { label: "fable", percent: 74, warn: false },
+    ]);
+  });
+
+  // Same rule as every other window: a reading whose own reset has gone by is not today's.
+  it("drops a per-model window whose reset has passed", () => {
+    const scoped = [{ label: "fable", usedPercentage: 74, resetsAt_sec: NOW / 1000 - 1 }];
+    expect(gaugeWindows({ fiveHour: window(9), sevenDay: null, scoped }, NOW)).toEqual([{ label: "5h", percent: 9, warn: false }]);
+  });
+
   it("marks a window at the warning threshold, not only past it", () => {
     expect(gaugeWindows({ fiveHour: window(WARN_PERCENT), sevenDay: null }, NOW)[0].warn).toBe(true);
     expect(gaugeWindows({ fiveHour: window(WARN_PERCENT - 1), sevenDay: null }, NOW)[0].warn).toBe(false);

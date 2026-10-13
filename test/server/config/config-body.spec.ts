@@ -46,6 +46,7 @@ describe("badArrayField", () => {
       "launchers",
       "customAgents",
       "quickCommands",
+      "toolbarLinks",
       "pushKinds",
       "soundKinds",
       "userMcpServers",

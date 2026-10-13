@@ -73,6 +73,9 @@ const props = defineProps<{
   expanded?: boolean;
   zoomed?: boolean;
   persistKey?: string | null;
+  // The branch's pull request, when the HOST is already drawing it (TerminalCell's `work` chip).
+  // The session's own PR chip below drops it, so the same number never appears twice on one header.
+  // Null when the host is not drawing it — a merged request leaves the work chip, and the number
   // The CANVAS side of <cwd>/.mulmoterminal.json — palette, font — is NOT a prop: this
   // component resolves it from its own cwd (see `dirConfig` below). It used to arrive as four
   // props, and four separate hosts each had to remember to pass them; two didn't, so a shell
@@ -88,7 +91,7 @@ const props = defineProps<{
   // text, and the icon buttons. Hex #rrggbb or null for the theme default.
 }>();
 const emit = defineEmits<{
-  (e: "session" | "cwd", value: string): void;
+  (e: "session" | "cwd" | "live-cwd", value: string): void;
   (e: "exit", exitCode: number | null): void;
   (e: "run", command: RunCommand): void;
   // The user typed (or pasted) into this terminal. Output the server writes back never fires it.
@@ -198,6 +201,9 @@ function onSkill(slug: string): void {
 // its own chip, so null the cwd here to skip redundant polling (status stays null).
 const gitCwd = computed(() => (props.devTerminal ? null : serverCwd.value));
 const { status: gitStatus } = useGitStatus(gitCwd);
+// The requests THIS session opened or edited, for the chip beside the Skill menu. Unlike the git
+// chip above it is NOT nulled in the grid: a session's own record has no equivalent on the cell's
+// info row, and the session id is this component's prop either way.
 const dragOver = ref(false);
 const { themeId } = useTheme();
 const { fontSize } = useTerminalFontSize();
@@ -265,9 +271,11 @@ onMounted(() => {
     {
       onSession: (id) => emit("session", id),
       onCwd: (c) => emit("cwd", c),
+      onLiveCwd: (c) => emit("live-cwd", c),
       onExit: (exitCode) => emit("exit", exitCode),
       onInput: () => emit("input"),
       onInputDropped: (willReconnect) => void showHint(willReconnect ? INPUT_DROPPED_EN : INPUT_DROPPED_ENDED_EN, "cloud_off"),
+      onNotice: (message) => void showHint(message, "folder_open"),
     },
     container,
     effectiveTermTheme(),

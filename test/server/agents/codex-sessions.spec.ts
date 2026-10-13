@@ -18,10 +18,21 @@ const envContextLine = (): string =>
     payload: { type: "message", role: "user", content: [{ type: "input_text", text: "<environment_context>…</environment_context>" }] },
   });
 
+const injectedLegacyLine = (): string =>
+  JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "# AGENTS.md instructions for /work\nignore this" } });
+
 describe("parseCodexRolloutHead", () => {
   it("extracts id, cwd, and the first real user message as title", () => {
     const head = [metaLine(UUID_A, "/work"), envContextLine(), userMsgLine("fix the login bug")].join("\n");
     expect(parseCodexRolloutHead(head)).toEqual({ id: UUID_A, cwd: "/work", title: "fix the login bug" });
+  });
+  it("skips injected legacy and current user rows", () => {
+    const currentInjected = JSON.stringify({
+      type: "response_item",
+      payload: { type: "message", role: "user", content: [{ type: "input_text", text: "<user_action>startup context</user_action>" }] },
+    });
+    const head = [metaLine(UUID_A, "/work"), injectedLegacyLine(), currentInjected, userMsgLine("the actual request")].join("\n");
+    expect(parseCodexRolloutHead(head)?.title).toBe("the actual request");
   });
   it("falls back to a generic title when there's no user message yet", () => {
     expect(parseCodexRolloutHead(metaLine(UUID_A, "/work"))).toEqual({ id: UUID_A, cwd: "/work", title: "Codex session" });

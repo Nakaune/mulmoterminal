@@ -27,6 +27,12 @@ const props = defineProps<{
   // launcher cells opt out without declaring anything: an ephemeral run and an empty launch slot
   // have nothing to come back to.
   parked?: boolean | undefined;
+  // The narrow layout keeps this row to what a phone can act on: the way back, and nothing else.
+  // The panes it drops (files, canvas, tools) each need a second column the phone does not have —
+  // they take the whole screen there, covering the terminal you opened the session to read — and
+  // park and close act on a GRID the phone is not arranging. All of them stay one tap away on the
+  // desktop, which is where that arranging happens.
+  phone?: boolean;
 }>();
 const emit = defineEmits<{ (e: "toggle-expand" | "close" | "toggle-files" | "toggle-canvas" | "toggle-tools" | "toggle-park"): void }>();
 
@@ -67,7 +73,7 @@ const parkTitle = computed(() => (props.parked ? "Wake this terminal" : "Set asi
        filmstrip thumbnail does not have. After expand/restore so the first `.cell-btn` keeps
        meaning what it always did. -->
   <button
-    v-if="expanded"
+    v-if="expanded && !phone"
     class="cell-btn"
     :class="filesClass"
     :aria-pressed="!!filesOpen"
@@ -81,7 +87,7 @@ const parkTitle = computed(() => (props.parked ? "Wake this terminal" : "Set asi
        never fill, and hiding the button outright leaves nothing to explain why. The title is
        where the fix goes, since a disabled control is the moment someone asks. -->
   <button
-    v-if="expanded"
+    v-if="expanded && !phone"
     data-testid="cell-canvas-btn"
     class="cell-btn"
     :class="canvasClass"
@@ -94,7 +100,7 @@ const parkTitle = computed(() => (props.parked ? "Wake this terminal" : "Set asi
     <span class="material-symbols-outlined" aria-hidden="true">draw</span>
   </button>
   <button
-    v-if="expanded"
+    v-if="expanded && !phone"
     class="cell-btn"
     :class="toolsClass"
     :aria-pressed="rightPane === 'tools'"
@@ -107,7 +113,7 @@ const parkTitle = computed(() => (props.parked ? "Wake this terminal" : "Set asi
   <!-- Before close on purpose: the two are the choice the user is making — set it aside, or end
        it — and the reversible one should not sit past the one that tears a session down. -->
   <button
-    v-if="parked !== undefined"
+    v-if="parked !== undefined && !phone"
     data-testid="cell-park-btn"
     class="cell-btn"
     :class="parkClass"
@@ -118,7 +124,7 @@ const parkTitle = computed(() => (props.parked ? "Wake this terminal" : "Set asi
   >
     <span class="material-symbols-outlined" aria-hidden="true">bedtime</span>
   </button>
-  <button class="cell-btn cell-close" :class="CELL_CLOSE_BTN" title="Close terminal" aria-label="Close terminal" @click="emit('close')">
+  <button v-if="!phone" class="cell-btn cell-close" :class="CELL_CLOSE_BTN" title="Close terminal" aria-label="Close terminal" @click="emit('close')">
     <span class="material-symbols-outlined" aria-hidden="true">close</span>
   </button>
 </template>

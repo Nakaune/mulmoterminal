@@ -20,6 +20,7 @@ import { shouldFlipZoom } from "./cellChromeRules";
 import { rosterAlertClass } from "./rosterAlertClasses";
 import { useRosterAlert } from "../composables/useRosterAlert";
 import { formatCwd } from "./cwdDisplay";
+import RosterPrsChip from "./RosterPrsChip.vue";
 import FilesPane, { type FilesPaneState } from "./FilesPane.vue";
 import GuiPanel from "./GuiPanel.vue";
 import ToolsPane from "./ToolsPane.vue";
@@ -69,11 +70,14 @@ export interface CockpitRow {
   response: string | null; // tail of the agent's latest reply
   fallback: string | null; // label when there's no prompt/summary yet (launcher/command name)
   phase: PrPhase; // the branch's PR workflow phase (`none` until a PR exists)
+  pr: number | null;
+  prUrl: string | null;
   workPhase: WorkPhase | null; // planning vs editing while working; null when unknown / not working
   headerColor: string | null; // the directory's configured header background, tinting the row
   headerTextColor: string | null; // and its text colour, so the row stays legible on that tint
   iconUrl: string | null; // the directory's `icon` image (#1421), or null when it sets none
   parked: boolean; // set aside by the user (#992) — the row sinks, unless it is blocked
+  reviewPending: boolean;
 }
 const props = defineProps<{
   cells: Cell[];
@@ -96,15 +100,23 @@ const props = defineProps<{
   // While a cell is zoomed: cockpit roster (true) vs thumbnail strip (false). Owned by GridView
   // so the toggle can live in the global toolbar rather than float over the stage.
   listMode: boolean;
+  // The fourth layout: one screen at a time, for a window too narrow to hold two panes
+  // (src/composables/phoneLayout.ts). The roster and the enlarged terminal stop being neighbours
+  // and become PLACES — the roster is the screen you are on until you tap a row, and the terminal
+  // is the screen you are on until you go back. Nothing else about the grid changes: the same
+  // cells, the same connections, the same roster rows.
+  phone?: boolean;
 }>();
 const emit = defineEmits<{
-  (e: "session" | "cwd", uid: number, value: string): void;
+  (e: "session", uid: number, id: string, prior: string | null): void;
+  (e: "cwd" | "live-cwd", uid: number, value: string): void;
   (e: "close" | "toggle-expand" | "focus-cell", uid: number): void;
   (e: "run" | "runSpare", uid: number, command: RunCommand): void;
   (e: "launch", uid: number, pick: LaunchPick): void;
   (e: "move", uid: number, dir: -1 | 1): void;
   (e: "status", uid: number, value: AttentionStatus): void;
   (e: "agent", uid: number, value: TerminalAgent): void;
+  (e: "review-pending", uid: number, value: boolean): void;
   (e: "park", uid: number, value: boolean): void;
   // Shared preset list events — uid-less since they mutate the one config list.
   (e: "record-cwd" | "remove-preset", value: string): void;
@@ -260,7 +272,13 @@ function restoreSessionPane(uid: number): void {
 // where you asked for it, and the thing it hid is the thing you were working in. So it lasts as
 // long as the pane does — closing it, or switching to another one, is the end of the takeover.
 const paneExpanded = ref(false);
-const paneFull = computed(() => paneExpanded.value && (rightPane.value === "canvas" || rightPane.value === "tools"));
+// A phone has room for the terminal or the pane, never both — so an open pane is always the full
+// row there, files included (the one the expand toggle does not otherwise offer). This is not a
+// nicety: `pane-full` is what parks the terminal OFF-SCREEN at a real size, and the alternative on
+// a 390px window is an xterm squeezed toward zero, which comes back reflowed (#1125).
+const paneFull = computed(
+  () => rightPane.value !== null && (props.phone === true || (paneExpanded.value && (rightPane.value === "canvas" || rightPane.value === "tools"))),
+);
 function togglePaneExpanded(): void {
   paneExpanded.value = !paneExpanded.value;
 }
@@ -557,6 +575,9 @@ const gridCellProps = (cell: Cell) => ({
   // one that badges the workspace with the folder's name while its neighbour says WORKSPACE.
   defaultCwd: props.defaultCwd,
   reorderable: props.reorderable ?? false,
+  // Grid-wide like defaultCwd: every cell type trims the same way, and a cell left out of this is
+  // one that draws a desktop's worth of chrome over a 390px terminal.
+  phone: props.phone ?? false,
 });
 const gridCellEvents = (cell: Cell) => ({
   "toggle-expand": () => emit("toggle-expand", cell.uid),
@@ -983,15 +1004,21 @@ watch(
 </script>
 
 <template>
-  <div ref="stage" class="stage" :class="{ zoomed, listmode: listMode, flipping: flippingUids.size > 0 }" :style="flipVars" @focusin="onFocusIn">
+  <div ref="stage" class="stage" :class="{ zoomed, listmode: listMode, phone, flipping: flippingUids.size > 0 }" :style="flipVars" @focusin="onFocusIn">
     <!-- Cockpit roster: a tall text row per cell (status / dir / memo / summary / prompt / latest
          reply). Click a row to swap which terminal is enlarged. -->
+    <!-- On a phone the roster is not a side panel but the LIST SCREEN, so the two states swap:
+         it fills the stage while nothing is zoomed, and steps aside entirely once something is —
+         the terminal gets the whole window, the way it does in the apps this follows. Its width
+         is the stage's there, so `rosterWidth` (a drag the phone has no splitter for) is not
+         applied. -->
     <aside
-      v-if="zoomed && listMode"
+      v-if="phone ? !zoomed : zoomed && listMode"
       ref="roster"
       data-testid="cockpit"
-      class="flex min-w-0 shrink-0 grow-0 flex-col gap-[5px] overflow-y-auto bg-deep p-1.5"
-      :style="{ flexBasis: `${rosterWidth}px` }"
+      class="flex min-w-0 flex-col gap-[5px] overflow-y-auto bg-deep p-1.5"
+      :class="phone ? 'flex-auto' : 'shrink-0 grow-0'"
+      :style="phone ? undefined : { flexBasis: `${rosterWidth}px` }"
     >
       <div
         v-for="row in listRows"
@@ -1000,8 +1027,13 @@ watch(
         role="button"
         :tabindex="0"
         data-testid="cockpit-row"
-        class="flex shrink-0 cursor-pointer flex-col gap-1 overflow-hidden rounded-lg border border-l-[3px] px-2.5 py-2 text-left text-fg focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#4a9eff]"
-        :class="rosterAlertClass(row.status, { expanded: row.uid === expandedUid, blink: rosterBlink, parked: row.parked })"
+        class="flex shrink-0 cursor-pointer flex-col gap-1 overflow-hidden rounded-lg border border-l-[3px] px-2.5 text-left text-fg focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#4a9eff]"
+        :class="[
+          rosterAlertClass(row.status, { expanded: row.uid === expandedUid, blink: rosterBlink, parked: row.parked }),
+          // A taller row on a phone: this is the only target on the list screen, and it is hit
+          // with a thumb rather than pointed at.
+          phone ? 'py-3' : 'py-2',
+        ]"
         @click="row.uid !== expandedUid && emit('toggle-expand', row.uid)"
         @keydown.enter.self.prevent="row.uid !== expandedUid && emit('toggle-expand', row.uid)"
         @keydown.space.self.prevent="row.uid !== expandedUid && emit('toggle-expand', row.uid)"
@@ -1020,6 +1052,9 @@ watch(
           :icon-url="row.iconUrl"
           :work-phase="row.workPhase"
           :phase="row.phase"
+          :pr="row.pr"
+          :pr-url="row.prUrl"
+          :review-pending="row.reviewPending"
         >
           <CockpitRowMenu
             v-if="reorderable"
@@ -1028,6 +1063,15 @@ watch(
             @move="(dir) => emit('move', row.uid, dir)"
           />
         </CockpitHeader>
+        <!-- What the session in this row has done to pull requests. On the roster and not only in
+             the expanded cell's header, because the list is where "which session touched which
+             request" is read without opening anything.
+             Its own line UNDER the header rather than inside it: that first line already carries
+             the status, the agent, a path that truncates to fit, and the row menu, so every pixel
+             the chip takes there comes out of the path. Draws nothing until the session has
+             touched a request, and a component that renders nothing produces no element — so an
+             untouched row keeps its height and the flex gap does not open under it. -->
+        <RosterPrsChip :session-id="sessionOf(row.uid)" />
         <!-- The user's own note, above every line below it: those are what the AGENT said, and the
              memo is the user saying what the cell is FOR (#1084) — the same precedence the cell
              header, the sidebar row and the phone's roster already share via sessionDisplayName.
@@ -1068,7 +1112,7 @@ watch(
     <!-- Roster | enlarged cell. Same separator as the file pane's, mirrored: the roster is BEFORE
          it, so the pointer and the arrow keys both move it the other way (#1077). -->
     <div
-      v-if="zoomed && listMode"
+      v-if="zoomed && listMode && !phone"
       data-testid="roster-splitter"
       class="w-[5px] flex-none cursor-col-resize bg-border hover:bg-accent focus-visible:bg-accent"
       role="separator"
@@ -1117,7 +1161,7 @@ watch(
           :initial-state="paneState"
           :canvas-target="expandedUid !== null"
           :workspace="defaultCwd"
-          :style="{ flex: `0 0 ${paneWidth}px` }"
+          :style="paneFull ? { flex: '1 1 0%' } : { flex: `0 0 ${paneWidth}px` }"
           class="border-l border-border bg-deep"
           @close="setFilesOpen(false)"
           @open-in-canvas="openFileInCanvas"
@@ -1158,7 +1202,7 @@ watch(
     <!-- Enlarged cell / thumbnail strip. The stage is a COLUMN in strip mode, so this separator
          is the horizontal one — dragged up and down, and driven by Up/Down rather than Left/Right. -->
     <div
-      v-if="zoomed && !listMode"
+      v-if="zoomed && !listMode && !phone"
       data-testid="strip-splitter"
       class="h-[5px] flex-none cursor-row-resize bg-border hover:bg-accent focus-visible:bg-accent"
       role="separator"
@@ -1186,7 +1230,7 @@ watch(
           :session="cell.session"
           :cwd="cell.cwd"
           v-on="gridCellEvents(cell)"
-          @session="(id) => emit('session', cell.uid, id)"
+          @session="(id) => emit('session', cell.uid, id, null)"
         />
         <TerminalCell
           v-else
@@ -1195,6 +1239,7 @@ watch(
           :initial-session-id="cell.session"
           :initial-cwd="cell.cwd"
           :initial-agent="cell.agent"
+          :review-pending="cell.reviewPending === true"
           :presets="presets"
           :launchers="launchers"
           :custom-agents="customAgents ?? []"
@@ -1204,9 +1249,11 @@ watch(
           :parked="cell.parked === true"
           v-on="gridCellEvents(cell)"
           @park="(on) => emit('park', cell.uid, on)"
-          @session="(id) => emit('session', cell.uid, id)"
+          @session="(id, prior) => emit('session', cell.uid, id, prior ?? null)"
           @agent="(a) => emit('agent', cell.uid, a)"
+          @review-pending="(pending) => emit('review-pending', cell.uid, pending)"
           @cwd="(c) => emit('cwd', cell.uid, c)"
+          @live-cwd="(c) => emit('live-cwd', cell.uid, c)"
           @record-cwd="(c) => emit('record-cwd', c)"
           @remove-preset="(path) => emit('remove-preset', path)"
           @run="(cmd) => emit('run', cell.uid, cmd)"
@@ -1310,6 +1357,48 @@ watch(
 .stage.zoomed.listmode .grid > * {
   width: 900px;
   height: 600px;
+}
+
+/* Phone: one screen at a time. The stage stays a COLUMN — whichever of the roster and the
+   terminal is showing gets the whole of it, so neither needs a basis of its own.
+
+   The tiled grid is parked off-screen in BOTH phone states, not just the zoomed one. That is the
+   load-bearing half of #1125 carried over: the cells have to stay MOUNTED (their PTY connections
+   and metadata are live, and the roster is a view of them) while never being laid out at the
+   window's size — a phone-width tile would refit every xterm to 390px and hand the PTY that as
+   its column count, so going back to the desktop would find every session reflowed.
+
+   Written as its own rule rather than by widening the list-mode selector above: that one is keyed
+   on `.zoomed`, and the whole point here is the state where nothing is. */
+.stage.phone .grid {
+  position: absolute;
+  left: -99999px;
+  top: 0;
+  width: 900px;
+  height: 600px;
+  display: block;
+  overflow: hidden;
+  padding: 0;
+}
+
+.stage.phone .grid > * {
+  width: 900px;
+  height: 600px;
+}
+
+/* The roster fills the window rather than sitting in a `flex-basis` lane, and the terminal does
+   the same once one is open. Full-bleed on purpose: 12px of padding either side is 6% of a 390px
+   window, and it buys nothing a phone reader wants. */
+.stage.phone.zoomed .zoom-main {
+  padding: 0;
+}
+
+/* Beats `.stage.zoomed.listmode`'s `flex-direction: row`, whatever the source order, because the
+   phone rule carries the extra class. Without it a roster with `flex-auto` would try to share the
+   row with a `zoom-main` that is display:none — harmless — but a zoomed phone would put the
+   terminal in a row beside nothing and inherit the row padding above. */
+.stage.phone.zoomed.listmode {
+  flex-direction: column;
 }
 
 /* Strip mode (toggle): the original filmstrip — expanded terminal on top, thumbnails below. */

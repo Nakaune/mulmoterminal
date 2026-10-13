@@ -1,6 +1,13 @@
 // @vitest-environment node
 import { describe, it, expect } from "vitest";
-import { resolveSession, type SessionFacts, resolveReattachableId, canStartLauncher, isContinuingSession } from "../../../server/session/session-resolve.js";
+import {
+  resolveSession,
+  type SessionFacts,
+  resolveReattachableId,
+  canStartLauncher,
+  isContinuingSession,
+  servesAgent,
+} from "../../../server/session/session-resolve.js";
 
 const FIXED = "fresh-minted-id";
 const mint = () => FIXED;
@@ -129,5 +136,64 @@ describe("canStartLauncher", () => {
 
   it("allows the shell button, which has no configured index", () => {
     expect(canStartLauncher(facts({ isShell: true }))).toBe(true);
+  });
+});
+
+// Which endpoint a LIVE session may be handed to. `?session=` is only what the browser last held,
+// so a cell relaunched as another agent can carry its old id into the new endpoint — and nothing
+// downstream looks before reattaching. Observed on 2026-09-22: a cell launched as codex came back
+// holding the claude session already open in another cell, the same id in both.
+describe("servesAgent", () => {
+  it("refuses a live session belonging to another agent", () => {
+    expect(servesAgent("claude", "codex")).toBe(false);
+    expect(servesAgent("codex", "claude")).toBe(false);
+    expect(servesAgent("grok", "antigravity")).toBe(false);
+  });
+
+  it("serves a session running the agent that asked for it", () => {
+    expect(servesAgent("codex", "codex")).toBe(true);
+    expect(servesAgent("claude", "claude")).toBe(true);
+  });
+
+  it("serves anything when the caller names no agent, which is the launcher", () => {
+    // A launcher runs the user's own command line and reattaches whatever is in the pane on
+    // purpose — the index is ignored on a reattach, because the pty already IS the program.
+    expect(servesAgent("claude", undefined)).toBe(true);
+    expect(servesAgent("codex", undefined)).toBe(true);
+  });
+
+  it("serves a pane whose program is not an agent at all", () => {
+    // A shell, a pager, a build. None of these say whose session it is, and refusing on a guess
+    // would break reattaching a session that is perfectly good.
+    expect(servesAgent("bash", "codex")).toBe(true);
+    expect(servesAgent("zsh", "claude")).toBe(true);
+    expect(servesAgent("node", "codex")).toBe(true);
+  });
+
+  it("serves when the program cannot be read", () => {
+    // tmux answers null for a session it cannot inspect; a restart leaves nothing recorded.
+    expect(servesAgent(null, "codex")).toBe(true);
+    expect(servesAgent(undefined, "codex")).toBe(true);
+    expect(servesAgent("", "codex")).toBe(true);
+  });
+
+  it("feeds the resolvers: a refused session mints a fresh id rather than reattaching", () => {
+    // The composition is the fix. servesAgent only answers false; it is resolveReattachableId
+    // turning that into a NEW id that gives the user the session they actually asked for.
+    const claudesId = "11111111-1111-4111-8111-111111111111";
+    const hasLivePty = servesAgent("claude", "codex"); // a live claude pty, asked for as codex
+    expect(resolveReattachableId(claudesId, { hasLivePty, tmuxAlive: false, canResume: false }, mint)).toEqual({
+      reattachId: null,
+      sessionId: FIXED,
+    });
+  });
+
+  it("still reattaches that same session to the endpoint it belongs to", () => {
+    const claudesId = "11111111-1111-4111-8111-111111111111";
+    const hasLivePty = servesAgent("claude", "claude");
+    expect(resolveReattachableId(claudesId, { hasLivePty, tmuxAlive: false, canResume: false }, mint)).toEqual({
+      reattachId: claudesId,
+      sessionId: claudesId,
+    });
   });
 });
