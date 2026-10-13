@@ -131,4 +131,13 @@ export function mountToolRoutes(app: Express, deps: ToolRouteDeps): void {
     if (!SESSION_ID_RE.test(sessionId)) return res.status(400).json({ error: "invalid sessionId" });
     res.json({ sessionId, toolCalls: await deps.stores.toolCallsStore.get(sessionId) });
   });
+
+  // The pull requests THIS session opened or changed, newest act first — the header chip's
+  // source. A different question from /api/pr-phase, which answers about a directory's CURRENT
+  // BRANCH and so says nothing in a workspace cell whose requests all live in worktrees elsewhere.
+  app.get("/api/session-prs/:sessionId", async (req, res) => {
+    const { sessionId } = req.params;
+    if (!SESSION_ID_RE.test(sessionId)) return res.status(400).json({ error: "invalid sessionId" });
+    res.json({ sessionId, prs: await deps.stores.getSessionPrs(sessionId) });
+  });
 }

@@ -26,25 +26,35 @@ export const readRolloutTail = (file: string): string[] => readTailLines(file, C
 
 export const codexSessionsDir = (): string => path.join(os.homedir(), ".codex", "sessions");
 
+// More than one rollout is read because the newest file is no longer the same question as the
+// newest reading of the budget the gauge shows: two sessions of one account can be on different
+// limits at the same time (see isPlanRateLimits in codex-rate-limits.ts), and the busiest session
+// is not necessarily the one on the plan. The caller stops at the first file that answers, so this
+// count is what it costs only when NONE of them does.
+export const ROLLOUT_SEARCH_MAX_FILES = 6;
+
 // The walk below is synchronous and covers the whole sessions tree — hundreds of files on a
 // long-standing install — while the refresh route calls it on every poll. Unthrottled, that blocks
-// the event loop (every terminal socket with it) on a schedule. Which file is newest changes only
+// the event loop (every terminal socket with it) on a schedule. Which files are newest changes only
 // when Codex starts one, so re-walking within this window can only produce the same answer.
 const NEWEST_FILE_CACHE_MS = 30_000;
-let cached: { root: string; file: string | null; at_ms: number } | null = null;
+let cached: { root: string; files: string[]; at_ms: number } | null = null;
 
-/** The most recently modified `*.jsonl` under the sessions tree, or null. Codex nests them by
- * date (`2026/07/28/rollout-….jsonl`), so this walks rather than reading one directory. */
-export function newestRolloutFile(root: string, now_ms: number): string | null {
-  if (cached && cached.root === root && now_ms - cached.at_ms < NEWEST_FILE_CACHE_MS) return cached.file;
-  const file = walkForNewest(root, now_ms);
-  cached = { root, file, at_ms: now_ms };
-  return file;
+/** The most recently modified `*.jsonl` files under the sessions tree, newest first, at most
+ * `max`. Codex nests them by date (`2026/07/28/rollout-….jsonl`), so this walks rather than
+ * reading one directory. Empty when the tree holds none. */
+export function newestRolloutFiles(root: string, now_ms: number, max: number = ROLLOUT_SEARCH_MAX_FILES): string[] {
+  if (cached && cached.root === root && now_ms - cached.at_ms < NEWEST_FILE_CACHE_MS) return cached.files.slice(0, max);
+  const files = walkForNewest(root, now_ms);
+  cached = { root, files, at_ms: now_ms };
+  return files.slice(0, max);
 }
 
-/** Uncached, so a test can exercise the walk itself without reaching through the cache. */
-export function walkForNewest(root: string, now_ms: number): string | null {
-  if (!existsSync(root)) return null;
+/** Uncached, so a test can exercise the walk itself without reaching through the cache. Newest
+ *  first, and every file the tree holds — the cap is the caller's, so one cache serves any of
+ *  them. */
+export function walkForNewest(root: string, now_ms: number): string[] {
+  if (!existsSync(root)) return [];
   const found: { file: string; stamp_ms: number }[] = [];
   const walk = (dir: string, depth: number): void => {
     const MAX_DEPTH = 5;
@@ -65,5 +75,5 @@ export function walkForNewest(root: string, now_ms: number): string | null {
   } catch {
     // an unreadable subtree costs whatever it held, not the feature
   }
-  return found.reduce<{ file: string; stamp_ms: number } | null>((best, c) => (best === null || c.stamp_ms > best.stamp_ms ? c : best), null)?.file ?? null;
+  return [...found].sort((a, b) => b.stamp_ms - a.stamp_ms).map((c) => c.file);
 }

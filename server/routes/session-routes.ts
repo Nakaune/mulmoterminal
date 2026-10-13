@@ -22,6 +22,8 @@ import {
   failedWorkersHydrated,
   unplacedSessionsHydrated,
   placedSessionsHydrated,
+  sessionCwd,
+  devTerminalCwdsHydrated,
   unplacedSessionRows,
   ptys,
   devTerminalSessions,
@@ -45,6 +47,7 @@ import {
 import { formatHandoff, type HandoffShape } from "../session/handoff-text.js";
 import { projectSessionsDir } from "../session/project-dir.js";
 import { runningKeyOf, runningSessionKeys, sessionAttached } from "../session/dir-session.js";
+import { liveSessionRows } from "../session/live-sessions.js";
 import type { SessionOccupancy } from "../../common/sessionOccupancy.js";
 import type { SessionRunning } from "../../common/sessionRunning.js";
 import { tmuxAttachedCounts } from "../infra/tmux.js";
@@ -56,7 +59,7 @@ import { grokSessionsRoot } from "../agents/grok-session.js";
 import { listGrokSessions } from "../agents/grok-sessions.js";
 import { conversationSessionKeys, type AgentConversation } from "../session/agent-conversations.js";
 import { AGENT_SESSION_LIST_PATHS } from "../../common/agentSessionList.js";
-import { TERMINAL_AGENTS, type TerminalAgent } from "../../common/sessionAgent.js";
+import { TERMINAL_AGENTS, type SessionAgent, type TerminalAgent } from "../../common/sessionAgent.js";
 import type { SessionMeta } from "../session/types.js";
 import { parseActivityIds, selectSessionRows } from "../session/session-list.js";
 import { agentBadges } from "../session/agent-badges.js";
@@ -76,10 +79,17 @@ const ACTIVITY_IDS_LIMIT = 200;
 
 export interface SessionRouteDeps {
   /** Kick off a re-title for a session the roster just showed, when it has moved on enough. */
-  freshenRosterTitle: (sessionId: string, cwd: string, currentUserTurns: number) => void;
+  freshenRosterTitle: (sessionId: string, cwd: string, currentUserTurns: number, agent?: TerminalAgent) => void;
   /** Fan a session's row out on the "sessions" channel, so every OTHER open cell, tab and
    *  phone sees an edited memo without asking. */
   publishActivity: (sessionId: string) => void;
+  /** Every `mt-<id>` tmux session on this machine — what is RUNNING here, which outlives both this
+   *  server process and every browser. Injected rather than imported so the route stays testable
+   *  without a tmux server, the same way the two above are. */
+  liveSessionIds: () => string[];
+  /** What one session runs: its live PTY's answer, else what tmux says is in the pane. Already
+   *  built for the phone's remote view (index.ts), and the same question this route asks. */
+  sessionAgent: (sessionId: string) => SessionAgent | null;
 }
 
 // GRID-ONLY (dev_tool): initial per-session status + last prompt, so a grid cell
@@ -97,10 +107,10 @@ async function sessionDetail(req: Request<{ id: string }>, res: Response, freshe
   // defaults to Claude, so a client that does not send it (an older build, the single view) gets
   // exactly what it got before.
   const agent = normalizeAgent(req.query.agent);
-  const { lastPrompt: transcriptPrompt, lastResponse: transcriptResponse, userTurns, usage, context, workPhase } = await readSessionSummary(cwd, id);
+  const { lastPrompt: transcriptPrompt, lastResponse: transcriptResponse, userTurns, usage, context, workPhase } = await readSessionSummary(cwd, id, agent);
   const badges = agent === "claude" ? { usage, context } : await agentBadges(cwd, id, agent);
   // If we haven't titled it yet, kick off a summary; sessionDetailView falls back meanwhile.
-  freshenRosterTitle(id, cwd, userTurns);
+  freshenRosterTitle(id, cwd, userTurns, agent);
   await sessionMemosHydrated; // a cell seeding on boot must not be told its memo is gone
   const view = sessionDetailView(
     { lastPrompt: lastPrompts.get(id), lastResponse: lastResponses.get(id), aiTitle: aiTitles.get(id), memo: sessionMemos.get(id) },
@@ -379,6 +389,36 @@ export function mountSessionRoutes(app: Express, deps: SessionRouteDeps): void {
   // Hidden workers are absent by construction — the mark is only ever set for a visible spawn —
   // and a spec pins that, since "it happens not to be marked" and "it cannot be marked" read the
   // same until someone adds a caller.
+  // Every session with a live PTY on THIS machine, whoever placed it.
+  //
+  // A different question from /api/sessions/unplaced next door, and the difference is the whole
+  // point: "unplaced" means no grid has taken the session, and placement is tracked server-side
+  // and globally — so once the desktop has adopted its sixteen cells, a second client asking for
+  // unplaced ones is correctly told there are none. The grid arrangement lives in
+  // `localStorage`, which is per ORIGIN, so a phone reaching the same server over the tunnel
+  // starts with an empty grid and no way to fill it: every session it could show is already
+  // placed somewhere it cannot see.
+  //
+  // This route answers "what is running here", which is the only question a second screen can
+  // usefully ask. It reports the PTY's own cwd and agent rather than a remembered mark: these are
+  // live entries by construction, so the process that is actually running is the best source there
+  // is — and the agent decides which endpoint a cell reconnects on (PR #1189).
+  //
+  // Workers are absent: a background chat and a translation worker are not sessions anyone asked
+  // to look at, and putting them on a phone's list would bury the ones that were.
+  app.get("/api/sessions/live", async (_req, res) => {
+    // The cwd log too: for a session no client has opened since the restart there is no PtyEntry
+    // to ask, and its directory is the difference between adopting the cell where it belongs and
+    // dropping it in the workspace.
+    await Promise.all([backgroundSessionsHydrated, devTerminalCwdsHydrated]);
+    res.json({
+      sessions: liveSessionRows(deps.liveSessionIds(), {
+        agent: deps.sessionAgent,
+        cwd: sessionCwd,
+        excluded: (id) => isBackgroundSession(id) || translationWorkerIds.has(id) || isProbeSessionId(id),
+      }),
+    });
+  });
   app.get("/api/sessions/unplaced", async (_req, res) => {
     await Promise.all([unplacedSessionsHydrated, placedSessionsHydrated]);
     const sessions = unplacedSessionRows().map(({ id, agent }) => {

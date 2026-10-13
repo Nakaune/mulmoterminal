@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, it, expect } from "vitest";
-import { extractCodexRateLimits, latestRateLimitsInRollout } from "./codex-rate-limits";
+import { extractCodexRateLimits, isPlanRateLimits, latestRateLimitsInRollout } from "./codex-rate-limits";
 
 // The shape below is copied from a real rollout file, not invented: Codex names its windows
 // `primary` / `secondary` and only `window_minutes` says which is which.
@@ -91,5 +91,87 @@ describe("latestRateLimitsInRollout", () => {
 
   it("returns null when no line carries the windows", () => {
     expect(latestRateLimitsInRollout(['{"type":"message"}', "", "not json"])).toBeNull();
+  });
+});
+
+// Both shapes below were copied from real rollouts written by ONE account on 2026-08-27, minutes
+// apart. Taking whichever came last is what showed 0% while 22% of the plan's week was spent.
+const planShape = {
+  limit_id: "codex",
+  limit_name: null,
+  primary: { used_percent: 22.0, window_minutes: SEVEN_DAY_MIN, resets_at: 1788272886 },
+  secondary: null,
+  plan_type: "prolite",
+};
+const poolShape = {
+  limit_id: "codex_bengalfox",
+  limit_name: "GPT-5.3-Codex-Spark",
+  primary: { used_percent: 0.0, window_minutes: FIVE_HOUR_MIN, resets_at: 1787855196 },
+  secondary: { used_percent: 0.0, window_minutes: SEVEN_DAY_MIN, resets_at: 1788441996 },
+  plan_type: null,
+};
+// The same pool, re-read on 2026-09-06: it now carries the subscription's name too. Copied from a
+// real rollout, because this is the shape that stopped the gauge updating — 0% on screen while the
+// plan's week was 72% gone.
+const poolShapeWithPlanType = { ...poolShape, plan_type: "prolite" };
+
+describe("isPlanRateLimits", () => {
+  it("accepts the plan's own limit", () => {
+    expect(isPlanRateLimits(planShape)).toBe(true);
+  });
+
+  it("rejects a model pool that belongs to the same account", () => {
+    expect(isPlanRateLimits(poolShape)).toBe(false);
+  });
+
+  // The regression: `plan_type` describes the ACCOUNT, and a pool on that account started
+  // reporting it. A bucket that names a model is a pool whatever else it says.
+  it("rejects a model pool that also carries the subscription's plan_type", () => {
+    expect(isPlanRateLimits(poolShapeWithPlanType)).toBe(false);
+  });
+
+  // Still the fallback, so a bucket that names neither a model nor a limit_id is not lost.
+  it("accepts a plan named only by plan_type", () => {
+    expect(isPlanRateLimits({ primary: poolShape.primary, plan_type: "pro" })).toBe(true);
+  });
+
+  it("accepts a plan named only by limit_id", () => {
+    expect(isPlanRateLimits({ ...planShape, plan_type: null })).toBe(true);
+  });
+
+  it.each([null, undefined, "codex", 7, []])("rejects %o", (input) => {
+    expect(isPlanRateLimits(input)).toBe(false);
+  });
+});
+
+describe("latestRateLimitsInRollout, filtered to the plan", () => {
+  const line = (limits: unknown) => JSON.stringify({ type: "event", payload: { rate_limits: limits } });
+
+  // The whole point: the pool entry is NEWER, and is still not the answer.
+  it("skips a newer pool entry to reach the plan's own", () => {
+    const found = latestRateLimitsInRollout([line(planShape), line(poolShape)], isPlanRateLimits);
+    expect(found?.sevenDay?.usedPercentage).toBe(22);
+  });
+
+  // Only the 7d window exists on this plan. Nothing may invent a 5h one — a 0% that is really
+  // "no such window" reads as room the user does not have.
+  it("leaves the window the plan does not have absent", () => {
+    expect(latestRateLimitsInRollout([line(planShape)], isPlanRateLimits)?.fiveHour).toBeNull();
+  });
+
+  it("says nothing when only a pool has written", () => {
+    expect(latestRateLimitsInRollout([line(poolShape)], isPlanRateLimits)).toBeNull();
+  });
+
+  // The 2026-09-06 shape, end to end: the newest line is a pool wearing the plan's plan_type, and
+  // the plan's own reading is older. The older one is still the answer.
+  it("skips a newer pool that carries plan_type to reach the plan's own", () => {
+    const found = latestRateLimitsInRollout([line(planShape), line(poolShapeWithPlanType)], isPlanRateLimits);
+    expect(found?.sevenDay?.usedPercentage).toBe(22);
+  });
+
+  // Unfiltered stays what it was, so the fallback path in index.ts still has an answer.
+  it("still takes the newest of any kind when unfiltered", () => {
+    expect(latestRateLimitsInRollout([line(planShape), line(poolShape)])?.fiveHour?.usedPercentage).toBe(0);
   });
 });

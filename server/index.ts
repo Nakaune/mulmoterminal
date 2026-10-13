@@ -5,6 +5,7 @@ import fs from "fs/promises";
 import { randomUUID } from "crypto";
 import { fileURLToPath } from "url";
 import { createPubSub } from "./infra/pubsub.js";
+import { assertRequiredClientFeatures } from "./infra/local-client-feature-guard.js";
 import { hideErrorStacks } from "./infra/hide-error-stacks.js";
 import { toolSummaries } from "./infra/plugins-registry.js";
 import { initMarkdownBackend } from "./backends/markdown.js";
@@ -12,6 +13,7 @@ import { initArtifactsBackend } from "./backends/artifacts.js";
 import { initOpenPathBackend } from "./backends/openPath.js";
 import { getUserMcpServers, getWorklogConfig, getTerminalSubmit, getQuickCommands, APP_CONFIG_FILE } from "./config/config-routes.js";
 import { enforceKeymap } from "./config/keymap-check.js";
+import { persistRepoColors } from "./config/auto-dir-color.js";
 import { readFileSync } from "node:fs";
 import { submitSequenceForAgent } from "../common/terminalSubmit.js";
 import { sessionDisplayName } from "../common/sessionMemo.js";
@@ -39,14 +41,15 @@ import { createClaudeSpawner } from "./session/spawn-claude.js";
 import { issueSpawnOptions } from "./session/issue-spawn-options.js";
 import { spawnPty } from "./session/pty-spawn.js";
 import { createRateLimitStore } from "./agents/rate-limit-store.js";
-import { startRateLimitProbe } from "./agents/rate-limit-probe.js";
+import { startRateLimitProbe, type ProbeHandle } from "./agents/rate-limit-probe.js";
 import { hasBinary } from "./infra/has-binary.js";
 import { newProbeSessionId } from "./agents/probe-session.js";
 import { writeProbeScreen } from "./agents/probe-stall.js";
 import { removeProbeTranscript, sweepLegacyProbeTranscriptsOnce } from "./agents/probe-transcript.js";
 import { removeLegacySandboxCredentials, removeLegacySandboxContainers } from "./infra/fs-cleanup.js";
-import { newestRolloutFile, codexSessionsDir, readRolloutTail } from "./agents/codex-rollout.js";
-import { latestRateLimitsInRollout } from "./agents/codex-rate-limits.js";
+import { newestRolloutFiles, codexSessionsDir, readRolloutTail } from "./agents/codex-rollout.js";
+import { latestRateLimitsInRollout, isPlanRateLimits } from "./agents/codex-rate-limits.js";
+import { claudeUsageCacheFile, readClaudeScopedWindows, readUsageCacheFetchedAt } from "./agents/claude-usage-cache.js";
 import { rateLimitCacheFile, readRateLimitCache, createRateLimitCacheWriter } from "./agents/rate-limit-persist.js";
 import { createCodexSpawner } from "./session/spawn-codex.js";
 import { createShellSpawners } from "./session/spawn-shell.js";
@@ -71,7 +74,10 @@ import {
   sessionMemosHydrated,
   markUnplacedSession,
   unplacedSessionsHydrated,
+  codexRollouts,
+  codexRolloutsHydrated,
 } from "./session/registry.js";
+import { codexRolloutPath } from "./agents/codex-sessions.js";
 import { hydrateClearedTranscripts } from "./session/cleared-transcripts.js";
 import { runWithHiddenMarker } from "./session/hiddenMarker.js";
 import { registerCompletionHook } from "./session/completion-hooks.js";
@@ -207,6 +213,15 @@ const GRID_MCP_TOOLS = autoAllowedToolNames().join(",");
 // because pub/sub only exists once the HTTP server does, and these are built before it.
 const toolStores = createToolStores({
   publish: (channel, data) => pubsub?.publish(channel, data),
+  // Where a Codex session's requests can be read from. Claude reports its own through the hook
+  // route as it works; Codex cells are plain terminals that report nothing, so the rollout on disk
+  // is the only record of what they ran (session/codex-session-pr.ts). Null for every other agent,
+  // which is what leaves their answer to the hook path alone.
+  codexRolloutFile: async (sessionId) => {
+    await codexRolloutsHydrated;
+    const conversationId = codexRollouts.get(sessionId)?.conversationId;
+    return conversationId ? codexRolloutPath(codexSessionsDir(), conversationId) : null;
+  },
 });
 
 // Bytes of recent output kept per pty and replayed when a client reattaches to
@@ -375,16 +390,38 @@ const isAllowedOrigin = createIsAllowedOrigin(browserHostnames);
 // Only a report carrying WINDOWS ends it. The status line also fires before the first API response,
 // when `rate_limits` is not there yet (see statusline.ts) — stopping on that would kill the probe
 // just before the thing it was spawned to collect.
-let stopClaudeRateLimitProbe: (() => void) | null = null;
+//
+// "Ends it" via `reported`, not `stop`: the report proves the TUI is listening, and that is the
+// probe's one safe moment to open `/usage`, which is where the per-model weekly windows (Fable)
+// come from (claude-usage-cache.ts). It stops itself as soon as claude has written them.
+let claudeRateLimitProbe: ProbeHandle | null = null;
 
 const writeRateLimitCacheIfChanged = createRateLimitCacheWriter(rateLimitCacheFile());
 const rateLimitStore = createRateLimitStore(readRateLimitCache(rateLimitCacheFile()), (snapshot, agent) => {
   writeRateLimitCacheIfChanged(snapshot);
-  if (agent === "claude") stopClaudeRateLimitProbe?.();
+  if (agent === "claude") claudeRateLimitProbe?.reported();
 });
+// The PLAN's windows, which is what the gauge is asked for — not whichever budget the busiest
+// session happens to be spending. One account can be on two limits at once (codex-rate-limits.ts),
+// and reading only the newest file showed a model pool's 0% while 22% of the plan's week was gone.
+//
+// Newest first, stopping at the first rollout that carries a plan reading: normally that is the
+// first or second file, and the full search is the price only when no session on the plan has
+// written recently. Falling back to the newest reading of any kind keeps the gauge showing
+// SOMETHING for an account whose rollouts never name a plan — an absent number and a wrong one are
+// both bad, and this way the wrong one is only reachable when there is no right one.
 const refreshCodexRateLimits = (): void => {
-  const file = newestRolloutFile(codexSessionsDir(), Date.now());
-  if (file) rateLimitStore.reportCodex(latestRateLimitsInRollout(readRolloutTail(file)), Date.now());
+  const now = Date.now();
+  const files = newestRolloutFiles(codexSessionsDir(), now);
+  for (const file of files) {
+    const plan = latestRateLimitsInRollout(readRolloutTail(file), isPlanRateLimits);
+    if (plan) {
+      rateLimitStore.reportCodex(plan, now);
+      return;
+    }
+  }
+  const newest = files[0];
+  if (newest) rateLimitStore.reportCodex(latestRateLimitsInRollout(readRolloutTail(newest)), now);
 };
 // Whether a probe could even run. Checked before spawning rather than discovered by spawning
 // (#1011): a machine without `claude` used to fail so fast that it never reached the 90s timeout,
@@ -420,19 +457,20 @@ const startClaudeRateLimitProbe = (): void => {
   }
   rateLimitStore.noteProbeStarted(Date.now());
   const sessionId = newProbeSessionId();
-  stopClaudeRateLimitProbe = startRateLimitProbe({
+  claudeRateLimitProbe = startRateLimitProbe({
     spawn: (args, cwd) => spawnPty(CLAUDE_BIN, args, cwd),
     host: "localhost",
     port: PORT,
     cwd: CLAUDE_CWD,
     sessionId,
+    usageCacheFetchedAt_ms: () => readUsageCacheFetchedAt(claudeUsageCacheFile()),
     // A probe that settles WITHOUT the status line having reported is the "asked, heard nothing"
     // case. report() has already moved the state on if anything arrived, so this only widens the
     // gap when nothing did.
     onSettled: ({ stall, screen }) => {
       // Cleared here rather than by whoever called stop(): `stop()` is idempotent, but a stale
       // reference would let the NEXT probe be killed by a late report belonging to this one.
-      stopClaudeRateLimitProbe = null;
+      claudeRateLimitProbe = null;
       // Only a probe that failed for a reason we cannot name leaves its screen behind — a named one
       // is already on the gauge, and a successful one has nothing to explain (#1293).
       if (rateLimitStore.noteProbeFailedIfNoReport(Date.now(), stall) && stall === "unknown") reportProbeScreen(screen);
@@ -462,6 +500,9 @@ if (removeLegacySandboxCredentials(MULMOTERMINAL_HOME)) void removeLegacySandbox
 // Codex costs nothing to read, so it is current before the first browser arrives.
 refreshCodexRateLimits();
 
+// LOCAL FORK: from here on a repository's reserved colour is written down (auto-dir-color.ts).
+persistRepoColors();
+
 const app = express();
 hideErrorStacks(app);
 // Generous body limit: PostToolUse hook payloads carry the tool's full output
@@ -474,6 +515,7 @@ mountAppRoutes(app, {
     refreshCodex: refreshCodexRateLimits,
     startProbe: startClaudeRateLimitProbe,
     claudeAvailable: claudeIsRunnable,
+    claudeScopedWindows: (now_ms) => readClaudeScopedWindows(claudeUsageCacheFile(), now_ms),
     now_ms: () => Date.now(),
   },
   isAllowedOrigin,
@@ -495,12 +537,16 @@ mountAppRoutes(app, {
   // Defined further down; reached only from a request, which cannot arrive before listen().
   registerBackgroundSession: (id: string) => scheduledSessions.register(id),
   agentOfSession: (id: string) => agentOfSession(id),
+  // The same union the phone's remote view takes: the PTYs this process holds, plus the tmux
+  // sessions that outlive it. A server restarted a minute ago holds two and sixteen are running.
+  liveSessionIds: () => [...new Set([...ptys.keys(), ...(tmuxAvailable() ? tmuxListSessionIds() : [])])],
   setWorking,
   setWaiting,
   publishActivity,
 });
 
 const server = http.createServer(app);
+if (process.env.NODE_ENV === "production") assertRequiredClientFeatures(path.resolve(process.cwd(), "dist"));
 pubsub = createPubSub(server, isAllowedOrigin);
 
 // Wire the shared file-change publisher (markdown + html live-refresh) against

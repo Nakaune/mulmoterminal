@@ -13,11 +13,13 @@ import { isRecord } from "../../common/isRecord.js";
 import { backgroundMarkers, markFailedWorker, markUnplacedSession } from "../session/registry.js";
 import { runWithHiddenMarker } from "../session/hiddenMarker.js";
 import { registerCompletionHook } from "../session/completion-hooks.js";
-import { backgroundChatMessage, parseBackgroundChat, spawnModeFor, type SpawnMode } from "../session/background-chat.js";
+import { backgroundChatMessage, parseBackgroundChat, resolveSpawnCwd, spawnModeFor, type SpawnMode } from "../session/background-chat.js";
 import { registeredGuiMcpGroups } from "../infra/gui-mcp-registration.js";
 import { TOOL_GROUPS, type ToolGroup } from "../../common/toolGroups.js";
 import { codexifySkillSeed } from "../agents/codex-skills.js";
 import { manageCollectionHandler } from "../infra/collection-tool.js";
+import { getCwdPresets, getRepoDirs } from "../config/config-routes.js";
+import { repoDirsFromPresets } from "../git/repo-dirs.js";
 import { upstreamFailureMessage } from "./plugin-narration.js";
 import type { SpawnClaudePty, SpawnCodexPty, SpawnAntigravityPty, SpawnGrokPty } from "../session/spawners.js";
 
@@ -44,14 +46,22 @@ export interface PluginRouteDeps {
 function spawnSeededSession(
   deps: PluginRouteDeps,
   mode: SpawnMode,
-  { sessionId, message, mcpGroups }: { sessionId: string; message: string; mcpGroups: readonly ToolGroup[] },
+  { sessionId, message, mcpGroups, cwd }: { sessionId: string; message: string; mcpGroups: readonly ToolGroup[]; cwd: string },
 ): void {
   const initialPrompt = codexifySkillSeed(message);
-  if (mode === "codex-run") deps.spawnCodexPty(sessionId, null, null, CLAUDE_CWD, true, { initialPrompt });
-  else if (mode === "antigravity-run") deps.spawnAntigravityPty(sessionId, null, null, CLAUDE_CWD, { mcpGroups, initialPrompt });
-  else if (mode === "grok-run") deps.spawnGrokPty(sessionId, null, null, CLAUDE_CWD, { mcpGroups, initialPrompt });
-  else if (mode === "claude-draft") deps.spawnClaudePty(sessionId, null, null, { draft: message });
-  else deps.spawnClaudePty(sessionId, null, null, { initialPrompt: message });
+  if (mode === "codex-run") deps.spawnCodexPty(sessionId, null, null, cwd, true, { initialPrompt });
+  else if (mode === "antigravity-run") deps.spawnAntigravityPty(sessionId, null, null, cwd, { mcpGroups, initialPrompt });
+  else if (mode === "grok-run") deps.spawnGrokPty(sessionId, null, null, cwd, { mcpGroups, initialPrompt });
+  else if (mode === "claude-draft") deps.spawnClaudePty(sessionId, null, null, { draft: message, cwd });
+  else deps.spawnClaudePty(sessionId, null, null, { initialPrompt: message, cwd });
+}
+
+// An absent cwd is the server's default, as before. A given one is checked against the default
+// directory and the known clones (resolveSpawnCwd), and a refusal is narrated like any other.
+async function spawnCwdFor(requested: string | undefined): ReturnType<typeof resolveSpawnCwd> {
+  if (requested === undefined) return { ok: true, cwd: CLAUDE_CWD };
+  const clones = (await repoDirsFromPresets(getCwdPresets(), getRepoDirs()).catch(() => [])).flatMap((r) => r.dirs.map((d) => d.path));
+  return resolveSpawnCwd(requested, [CLAUDE_CWD, ...clones]);
 }
 
 export function mountPluginRoutes(app: Express, deps: PluginRouteDeps): void {
@@ -67,15 +77,20 @@ export function mountPluginRoutes(app: Express, deps: PluginRouteDeps): void {
     const parsed = parseBackgroundChat(req.body);
     if (!parsed.ok) return res.json({ message: parsed.message });
     const { agent, draft, hidden, message } = parsed.request;
+    const where = await spawnCwdFor(parsed.request.cwd);
+    if (!where.ok) return res.json({ message: where.message });
+    const { cwd } = where;
     const sessionId = randomUUID();
     // The agents that read their GUI MCP servers from a FILE in the working directory — agy's
     // `.agents/mcp_config.json` and grok's `.grok/config.toml` — share that file with every other
     // session running there, so the groups have to be resolved BEFORE the spawn rewrites it:
     // passing none would clear the entries those sessions are using (#1095 review).
     const fileConfigAgent = agent === "antigravity" || agent === "grok";
-    const mcpGroups = fileConfigAgent ? await registeredGuiMcpGroups(CLAUDE_CWD, TOOL_GROUPS).catch(() => []) : [];
+    const mcpGroups = fileConfigAgent ? await registeredGuiMcpGroups(cwd, TOOL_GROUPS).catch(() => []) : [];
     try {
-      runWithHiddenMarker(hidden, sessionId, backgroundMarkers, () => spawnSeededSession(deps, spawnModeFor(agent, draft), { sessionId, message, mcpGroups }));
+      runWithHiddenMarker(hidden, sessionId, backgroundMarkers, () =>
+        spawnSeededSession(deps, spawnModeFor(agent, draft), { sessionId, message, mcpGroups, cwd }),
+      );
       // Visible: somebody should be able to SEE this session. The browser that asked for it
       // places it immediately (useChatLauncher), and this covers every other caller — an agent
       // calling the tool from another session, with no tab open at all. The mark is cleared the

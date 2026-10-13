@@ -239,6 +239,29 @@ wiki pages.
 - **Off by default, and it costs tokens** — each run spawns an LLM session. Say so before enabling.
 - The interval is whole hours, clamped to 1–168. Anything else falls back to 6.
 
+### `toolbarLinks` — links pinned beside the notification bell
+
+Pages you want one click away from anywhere in the app. They render as icon buttons in the app
+toolbar, immediately LEFT of the notification bell.
+
+```json
+{
+  "toolbarLinks": [
+    { "label": "開発ヒートマップ", "url": "http://localhost:34567/htmlfile/abs/home/me/heatmap.html", "icon": "calendar_month" }
+  ]
+}
+```
+
+- **Not a `launcher`.** Those START A CELL — a link put there costs a terminal to open a page.
+  Not a header `button` either: those live on one terminal and are scoped with `when`. This is app
+  chrome, with no session and no directory behind it.
+- `icon` is a Material Symbols name. Omit it and the link gets a generic glyph rather than a blank
+  30px gap.
+- `url` must be `http:` or `https:`. Anything else is dropped on save — an href is the one field
+  here that can run code.
+- At most 6, labels unique. The toolbar is a fixed row shared with the view buttons and the gauges.
+- No Settings control writes these: name them in `config.json`, or POST to `/api/config`.
+
 ### `cockpitLines` — how long a roster row is
 
 How many lines each row of the cockpit roster (the list beside an enlarged cell) shows before it

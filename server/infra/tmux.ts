@@ -301,6 +301,13 @@ export function tmuxPaneCommand(id: string): string | null {
   return name === "" ? null : name;
 }
 
+/** The terminal process, not the short-lived tmux client attaching to it. */
+export function tmuxPanePid(id: string): number | null {
+  const result = tmux(["display-message", "-p", "-t", tmuxSessionName(id), "#{pane_pid}"]);
+  const value = Number(result.stdout.trim());
+  return result.status === 0 && Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
 // The pane state that an application SETS ONCE and then relies on forever: which screen buffer
 // it owns, and which mouse reports it asked for. Read back as the DEC private modes that would
 // re-establish it (#1073).

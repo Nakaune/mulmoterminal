@@ -1,8 +1,9 @@
 import { existsSync, readdirSync } from "node:fs";
 import path from "node:path";
-import { isRecord } from "../../common/isRecord.js";
 import { cleanTitle, parseJsonRecord, readTranscriptHead } from "./transcript-head.js";
 import { byCodeUnit } from "../../common/byCodeUnit.js";
+import { codexUserTurnText } from "./codex-user-turn.js";
+import { parseSessionMetaRecord } from "./codex-session.js";
 
 const ROLLOUT_RE = /^rollout-.*\.jsonl$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -22,19 +23,6 @@ interface RolloutHead {
   title: string;
 }
 
-const isSessionMeta = (d: Record<string, unknown>): boolean =>
-  d.type === "session_meta" && isRecord(d.payload) && typeof d.payload.id === "string" && UUID_RE.test(d.payload.id);
-
-// codex records the first real prompt as an event_msg/user_message — distinct from the
-// environment_context it injects first (a response_item/message).
-const isUserMessage = (d: Record<string, unknown>): boolean =>
-  d.type === "event_msg" && isRecord(d.payload) && d.payload.type === "user_message" && typeof d.payload.message === "string";
-
-function stringField(doc: Record<string, unknown> | undefined, key: string): string | null {
-  const payload = doc?.payload;
-  return isRecord(payload) && typeof payload[key] === "string" ? payload[key] : null;
-}
-
 // From a rollout's head, pull the minted id + cwd (session_meta) and a title (first user message).
 // Returns null if there's no valid session_meta.
 export function parseCodexRolloutHead(head: string): RolloutHead | null {
@@ -42,10 +30,10 @@ export function parseCodexRolloutHead(head: string): RolloutHead | null {
     .split("\n")
     .map(parseJsonRecord)
     .filter((d): d is Record<string, unknown> => d !== null);
-  const meta = docs.find(isSessionMeta);
-  const id = stringField(meta, "id");
-  if (!id) return null;
-  return { id, cwd: stringField(meta, "cwd"), title: cleanTitle(stringField(docs.find(isUserMessage), "message"), DEFAULT_TITLE) };
+  const meta = docs.map(parseSessionMetaRecord).find((value) => value !== null);
+  if (!meta) return null;
+  const firstUserTurn = docs.map(codexUserTurnText).find((text): text is string => text !== null);
+  return { ...meta, title: cleanTitle(firstUserTurn ?? null, DEFAULT_TITLE) };
 }
 
 function subdirsDesc(dir: string): string[] {

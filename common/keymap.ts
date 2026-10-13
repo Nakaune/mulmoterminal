@@ -17,6 +17,7 @@ export const KEYMAP_ACTIONS = [
   "zoom-next",
   "zoom-prev",
   "next-attention",
+  "review-toggle",
   "terminal-new",
   "terminal-new-adjacent",
   "terminal-close",

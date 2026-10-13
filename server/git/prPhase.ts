@@ -31,6 +31,9 @@ export interface ParsedPr {
   isDraft: boolean;
   reviewDecision: string; // APPROVED | CHANGES_REQUESTED | REVIEW_REQUIRED | ""
   ci: CiState; // passing | failing | pending | none
+  // GitHub の `mergeable`: MERGEABLE | CONFLICTING | UNKNOWN。UNKNOWN は「まだ計算中」で、
+  // 開いた直後の PR が必ず一度は通る値なので、競合と同じ扱いにしてはいけない。
+  mergeable: string;
   url: string | null;
   number: number | null;
   title: string;
@@ -44,6 +47,7 @@ const toParsedPr = (o: Record<string, unknown>): ParsedPr => ({
   isDraft: o.isDraft === true,
   reviewDecision: typeof o.reviewDecision === "string" ? o.reviewDecision : "",
   ci: rollupCiState(o.statusCheckRollup),
+  mergeable: typeof o.mergeable === "string" ? o.mergeable : "",
   url: typeof o.url === "string" ? o.url : null,
   number: typeof o.number === "number" && Number.isSafeInteger(o.number) ? o.number : null,
   title: typeof o.title === "string" ? o.title : "",
@@ -62,14 +66,22 @@ export function parsePrList(stdout: string): ParsedPr[] {
 }
 
 // Pure lifecycle mapping. For an OPEN PR the order encodes what needs attention first:
-// still a draft → CI failing → review asked for changes → CI still running → otherwise
-// green and unblocked (ready to merge).
+// still a draft → CONFLICTING → CI failing → review asked for changes → CI still running →
+// otherwise green and unblocked (ready to merge).
+//
+// Conflict outranks a failing CI because it is the one that must be dealt with first: nothing
+// merges until the branch is rebased, and the checks that failed ran against a tree that no
+// longer exists — rebasing re-runs them anyway. Showing "CI fail" there sends you to a log
+// instead of to the rebase.
 export function derivePrPhase(pr: ParsedPr | null): PrPhase {
   if (!pr) return "none";
   const state = pr.state.toUpperCase();
   if (state === "MERGED") return "merged";
   if (state === "CLOSED") return "closed";
   if (pr.isDraft) return "draft";
+  // CONFLICTING only. `UNKNOWN` is GitHub still computing it — treating that as a conflict would
+  // flash red on every PR for the first seconds of its life.
+  if (pr.mergeable.toUpperCase() === "CONFLICTING") return "conflict";
   if (pr.ci === "failing") return "ci-failing";
   if (pr.reviewDecision.toUpperCase() === "CHANGES_REQUESTED") return "changes-requested";
   if (pr.ci === "pending") return "ci-running";
@@ -79,7 +91,7 @@ export function derivePrPhase(pr: ParsedPr | null): PrPhase {
 // Kept as the name the route and its spec already use; the shape is the shared wire type now.
 export type PrPhaseResult = WorkItem;
 
-const GH_FIELDS = "state,isDraft,reviewDecision,statusCheckRollup,url,number,body,title";
+const GH_FIELDS = "state,isDraft,reviewDecision,statusCheckRollup,mergeable,url,number,body,title";
 const cache = createTtlCache<PrPhaseResult>();
 
 export type PrPhaseDeps = BranchQueryDeps;

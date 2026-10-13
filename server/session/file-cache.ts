@@ -11,6 +11,8 @@
 export interface FileStamp {
   mtimeMs: number;
   size: number;
+  dev?: number;
+  ino?: number;
 }
 
 /** What a partially-folded, append-only file left behind: everything folded so far, and the byte
@@ -39,7 +41,7 @@ export function createAppendFileCache<T>(max = 500): AppendFileCache<T> {
   return {
     resume(key, stamp) {
       const hit = entries.get(key);
-      if (!hit || stamp.size < hit.stamp.size) return undefined;
+      if (!hit || stamp.size < Math.max(hit.stamp.size, hit.scan.from) || stamp.dev !== hit.stamp.dev || stamp.ino !== hit.stamp.ino) return undefined;
       if (stamp.size === hit.stamp.size && stamp.mtimeMs !== hit.stamp.mtimeMs) return undefined;
       return hit.scan;
     },

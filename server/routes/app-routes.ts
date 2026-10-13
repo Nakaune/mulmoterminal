@@ -20,7 +20,7 @@ import { mountPluginRoutes } from "../routes/plugin-routes.js";
 import { mountMcpRoutes } from "../routes/mcp-routes.js";
 import { guiCallRecorderFor, historyIsGuiOnly } from "../mcp/gui-call-history.js";
 import type { SessionAgent } from "../../common/sessionAgent.js";
-import { mountSessionRoutes } from "../routes/session-routes.js";
+import { mountSessionRoutes, type SessionRouteDeps } from "../routes/session-routes.js";
 import { mountToolRoutes } from "../routes/tool-routes.js";
 import { mountRepoRoutes } from "../routes/repo-routes.js";
 import { mountIssueWorkRoutes } from "../routes/issue-work-routes.js";
@@ -76,6 +76,8 @@ import type { SessionActivityDeps } from "../session/session-activity-deps.js";
 import { mountSpaFallback } from "../infra/spa-fallback.js";
 import { mountRateLimitRoutes, type RateLimitRouteDeps } from "../agents/rate-limit-routes.js";
 import { workspaceForRoute } from "./routeParams.js";
+import { mountSystemResourceRoutes } from "./system-resource-routes.js";
+import { createGridStateStore, gridStateFile, mountGridStateRoutes } from "./grid-state-routes.js";
 
 export interface AppRouteDeps extends SessionActivityDeps {
   clientDir: string;
@@ -94,6 +96,10 @@ export interface AppRouteDeps extends SessionActivityDeps {
   spawnGrokPty: ReturnType<typeof createGrokSpawner>["spawnGrokPty"];
   translateViaHiddenChat: ReturnType<typeof createTranslationWorker>["translateViaHiddenChat"];
   freshenRosterTitle: ReturnType<typeof createTitleManager>["freshenRosterTitle"];
+  /** Every session running on this machine: the PTYs this process holds UNION the `mt-<id>` tmux
+   *  sessions, which outlive both it and every browser. The phone's remote view already takes the
+   *  same union (index.ts) — the live-sessions route asks the same question. */
+  liveSessionIds: () => string[];
   reap: (id: string) => void;
   registerBackgroundSession: (id: string) => void;
 }
@@ -108,6 +114,16 @@ const DIR_CONFIG_CHANNEL = "dir-config";
 const sessionCallReporting = (deps: AppRouteDeps, sessionId: string) => ({
   agent: deps.agentOfSession(sessionId),
   reportsOwnCalls: hookedSessions.has(sessionId),
+});
+
+// Named rather than spelled out at the call site: the mapping is not one-to-one — the session
+// routes' `sessionAgent` is this file's `agentOfSession` — and four lines of it inside
+// mountAppRoutes is four lines of a function already at its length limit.
+const sessionRouteDeps = (deps: AppRouteDeps): SessionRouteDeps => ({
+  freshenRosterTitle: deps.freshenRosterTitle,
+  publishActivity: deps.publishActivity,
+  liveSessionIds: deps.liveSessionIds,
+  sessionAgent: deps.agentOfSession,
 });
 
 export function mountAppRoutes(app: Express, deps: AppRouteDeps): void {
@@ -125,6 +141,14 @@ export function mountAppRoutes(app: Express, deps: AppRouteDeps): void {
   mountDropRoutes(app);
 
   app.use(express.json({ limit: "25mb" }));
+
+  // The terminal grid is shared by every browser connected to this server. The persisted
+  // revision is authoritative; pub/sub only announces accepted writes, and reconnecting clients
+  // re-fetch it so a dropped socket cannot leave one browser on an old layout.
+  mountGridStateRoutes(app, {
+    store: createGridStateStore(gridStateFile(MULMOTERMINAL_HOME)),
+    publish: deps.publish,
+  });
 
   // Straight after the body parser and BEFORE every /api/plugin handler: rewrite
   // presentDocument / presentHtml's relative `path` to an absolute one under the calling
@@ -342,6 +366,7 @@ function mountSessionFacingRoutes(app: Express, deps: AppRouteDeps): void {
 
   // The 5h / 7d rate-limit gauge (#387): where the probe reports and where the header reads.
   mountRateLimitRoutes(app, deps.rateLimits);
+  mountSystemResourceRoutes(app);
 
   // GET /api/cost — estimated $ cost (session + today/month roll-up) for a project's
   // sessions, from public per-model pricing. Read-only; shown in the Settings modal (#245).
@@ -360,7 +385,7 @@ function mountSessionFacingRoutes(app: Express, deps: AppRouteDeps): void {
 
   // Sidebar listing, one session's detail, the grid's attention poll, the tool timeline and
   // codex's own sessions (see routes/session-routes.ts).
-  mountSessionRoutes(app, { freshenRosterTitle: deps.freshenRosterTitle, publishActivity: deps.publishActivity });
+  mountSessionRoutes(app, sessionRouteDeps(deps));
 
   // Explicit close (reliable deps.reap over HTTP) + one-shot orphan cleanup. Extracted to a
   // module so the origin guard / id validation / orphan-selection boundary are testable.
