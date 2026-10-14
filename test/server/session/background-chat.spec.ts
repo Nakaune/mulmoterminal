@@ -140,9 +140,11 @@ describe("parseBackgroundChat cwd", () => {
     expect(ok({ message: "go" }).cwd).toBeUndefined();
   });
 
-  it("drops a relative path, a non-string and an empty string", () => {
+  it("rejects a relative path, a non-string and an empty string", () => {
     for (const cwd of ["repo", "./repo", "../repo", "", 42, null, ["/abs"], { path: "/abs" }]) {
-      expect(ok({ message: "go", cwd }).cwd).toBeUndefined();
+      const parsed = parseBackgroundChat({ message: "go", cwd });
+      expect(parsed.ok).toBe(false);
+      if (!parsed.ok) expect(parsed.message).toMatch(/absolute directory path/);
     }
   });
 });

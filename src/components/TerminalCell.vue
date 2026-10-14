@@ -139,9 +139,8 @@ const emit = defineEmits<
     (e: "launch", value: LaunchPick): void;
     // The agent chosen for this fresh launch, so the grid persists it.
     (e: "agent", value: TerminalAgent): void;
-    (e: "review-pending", value: boolean): void;
+    (e: "review-pending" | "park", value: boolean): void;
     // Set this cell aside, or bring it back. The grid owns the flag; this only asks.
-    (e: "park", value: boolean): void;
   }
 >();
 

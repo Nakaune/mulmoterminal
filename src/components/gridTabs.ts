@@ -113,7 +113,8 @@ export function setSession(state: GridState, uid: number, id: string | null): Gr
   const cells = state.cells.map((c) => {
     if (c.uid !== uid) return c;
     if (c.session === id) return { ...c, session: id };
-    const { reviewPending: _reviewPending, ...withoutReview } = c;
+    const withoutReview = { ...c };
+    delete withoutReview.reviewPending;
     return { ...withoutReview, session: id };
   });
   const expanded = id === null && state.expanded === uid ? null : state.expanded;
@@ -142,7 +143,8 @@ export function setReviewPending(state: GridState, uid: number, pending: boolean
     cells: state.cells.map((c) => {
       if (c.uid !== uid) return c;
       if (pending) return { ...c, reviewPending: true };
-      const { reviewPending: _reviewPending, ...withoutReview } = c;
+      const withoutReview = { ...c };
+      delete withoutReview.reviewPending;
       return withoutReview;
     }),
   };
