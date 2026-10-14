@@ -524,9 +524,7 @@ function runShortcut(shortcut: GridShortcut) {
     // Focus the terminal it moves to, not just the state. In a plain grid nothing else shows
     // WHICH cell was picked — the focused cell lifts, and the cursor lands where the user is
     // being sent, so the next thing they type goes to the terminal that called them.
-    const target = nextAttentionUid(state.value, order, statusForSort.value, focusedCellUid.value);
-    state.value = nextAttention(state.value, order, statusForSort.value, focusedCellUid.value);
-    if (target !== null) void nextTick(() => conn.focus(`cell-${target}`));
+    focusNextShortcutAttention(order);
   } else if (shortcut === "terminal-new") {
     onAddTerminal();
   } else if (shortcut === "terminal-new-adjacent" && uid !== null) {
@@ -534,15 +532,25 @@ function runShortcut(shortcut: GridShortcut) {
   } else if (shortcut === "terminal-close" && uid !== null) {
     onClose(uid);
   } else if (shortcut === "review-toggle") {
-    const target = expandedUid.value ?? focusedCellUid.value;
-    if (target !== null) {
-      const cell = state.value.cells.find((c) => c.uid === target);
-      if (cell?.session) {
-        state.value = setReviewPending(state.value, target, cell.reviewPending !== true);
-        persist();
-      }
+    toggleShortcutReview();
+  }
+}
+
+function toggleShortcutReview() {
+  const target = expandedUid.value ?? focusedCellUid.value;
+  if (target !== null) {
+    const cell = state.value.cells.find((c) => c.uid === target);
+    if (cell?.session) {
+      state.value = setReviewPending(state.value, target, cell.reviewPending !== true);
+      persist();
     }
   }
+}
+
+function focusNextShortcutAttention(order: number[]) {
+  const target = nextAttentionUid(state.value, order, statusForSort.value, focusedCellUid.value);
+  state.value = nextAttention(state.value, order, statusForSort.value, focusedCellUid.value);
+  if (target !== null) void nextTick(() => conn.focus(`cell-${target}`));
 }
 
 // The dir a new adjacent terminal opens in: the one the current terminal is running in, which

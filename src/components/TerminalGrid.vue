@@ -116,8 +116,7 @@ const emit = defineEmits<{
   (e: "move", uid: number, dir: -1 | 1): void;
   (e: "status", uid: number, value: AttentionStatus): void;
   (e: "agent", uid: number, value: TerminalAgent): void;
-  (e: "review-pending", uid: number, value: boolean): void;
-  (e: "park", uid: number, value: boolean): void;
+  (e: "review-pending" | "park", uid: number, value: boolean): void;
   // Shared preset list events — uid-less since they mutate the one config list.
   (e: "record-cwd" | "remove-preset", value: string): void;
 }>();

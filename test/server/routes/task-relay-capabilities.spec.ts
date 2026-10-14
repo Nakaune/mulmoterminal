@@ -6,7 +6,7 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { parseBackgroundChat, resolveSpawnCwd } from "../../../server/session/background-chat.js";
-import { fingerprintTaskRelayBuild, mountTaskRelayCapabilities, TASK_RELAY_BUILD_ID } from "../../../server/routes/task-relay-capabilities.js";
+import { fingerprintTaskRelayBuild, mountTaskRelayCapabilities } from "../../../server/routes/task-relay-capabilities.js";
 import { mountPluginRoutes, type PluginRouteDeps } from "../../../server/routes/plugin-routes.js";
 
 const fixture = vi.hoisted(() => ({ root: "" }));
@@ -64,9 +64,59 @@ describe("task relay HTTP capability contract", () => {
       cwd_enforced: true,
       repo: "Nakaune/AidaNote",
       worktree: root,
-      build_id: TASK_RELAY_BUILD_ID,
+      build_id: response.body.build_id,
     });
-    expect(TASK_RELAY_BUILD_ID).toMatch(/^[0-9a-f]{64}$/);
+    expect(response.body.build_id).toMatch(/^[0-9a-f]{64}$/);
+  });
+  it("imports and mounts unconfigured with a minimal filesystem mock", async () => {
+    delete process.env.MULMO_TASK_RELAY_WORKTREE;
+    vi.resetModules();
+    vi.doMock("node:fs", () => ({}));
+    try {
+      const isolated = await import("../../../server/routes/task-relay-capabilities.js");
+      const server = express();
+      isolated.mountTaskRelayCapabilities(server, async (cwd) => ({ ok: true, cwd }));
+      expect((await request(server).get("/api/task-relay/capabilities")).status).toBe(503);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+  it("does not fingerprint an unconfigured mount or activate it from later environment changes", async () => {
+    delete process.env.MULMO_TASK_RELAY_WORKTREE;
+    const capture = vi.fn(() => {
+      throw new Error("minimal fs mock must not be used");
+    });
+    const server = express();
+    mountTaskRelayCapabilities(server, (cwd) => resolveSpawnCwd(cwd, [root]), capture);
+    expect(capture).not.toHaveBeenCalled();
+    process.env.MULMO_TASK_RELAY_WORKTREE = root;
+    expect((await request(server).get("/api/task-relay/capabilities")).status).toBe(503);
+    expect(capture).not.toHaveBeenCalled();
+  });
+  it("captures the configured build once at mount and retains startup configuration", async () => {
+    const capturedId = "a".repeat(64);
+    const capture = vi.fn(() => capturedId);
+    const server = express();
+    mountTaskRelayCapabilities(server, (cwd) => resolveSpawnCwd(cwd, [root]), capture);
+    expect(capture).toHaveBeenCalledOnce();
+    process.env.MULMO_TASK_RELAY_WORKTREE = outside;
+    for (let i = 0; i < 2; i++) {
+      const response = await request(server).get("/api/task-relay/capabilities");
+      expect(response.status).toBe(200);
+      expect(response.body.worktree).toBe(root);
+      expect(response.body.build_id).toBe(capturedId);
+    }
+    expect(capture).toHaveBeenCalledOnce();
+  });
+  it("fails closed when startup fingerprint capture throws without retrying", async () => {
+    const capture = vi.fn(() => {
+      throw new Error("unreadable shipped source");
+    });
+    const server = express();
+    mountTaskRelayCapabilities(server, (cwd) => resolveSpawnCwd(cwd, [root]), capture);
+    for (let i = 0; i < 2; i++) expect((await request(server).get("/api/task-relay/capabilities")).status).toBe(503);
+    expect(capture).toHaveBeenCalledOnce();
   });
   it("does not accept query parameters in place of owner configuration", async () => {
     delete process.env.MULMO_TASK_RELAY_WORKTREE;

@@ -780,9 +780,7 @@ export function attach(key: string, target: ConnTarget, handlers: ConnHandlers, 
   // The persisted xterm was just re-parented into a new host. The sync fit() above can no-op (same size)
   // or run before layout, leaving the canvas renderer blank until a scroll. Re-fit + force a repaint next
   // frame, once the host is laid out. Guarded so a slot that detached/re-attached meanwhile is left alone.
-  requestAnimationFrame(() => {
-    if (c.attachedEl === el) fit(key);
-  });
+  requestAnimationFrame(() => (c.attachedEl === el ? fit(key) : undefined));
 }
 
 // Unmount a view but KEEP the slot alive (socket stays open, PTY stays alive). The
@@ -937,9 +935,7 @@ const slotCandidate = (c: Conn): SlotCandidate => ({
   agent: c.target.agent ?? "claude",
 });
 
-export function listSlots(): SlotInfo[] {
-  return [...conns.values()].map(slotCandidate).flatMap((candidate) => readableSlot(candidate) ?? []);
-}
+export const listSlots = (): SlotInfo[] => [...conns.values()].map(slotCandidate).flatMap((candidate) => readableSlot(candidate) ?? []);
 
 // Insert text (a path, or space-joined paths) at the cursor via the normal input
 // channel — no trailing CR, so the user reviews and submits.
@@ -1012,16 +1008,14 @@ export function fit(key: string) {
 export function setTheme(key: string, theme: ITheme) {
   const c = conns.get(key);
   if (!c) return;
-  c.theme = theme;
-  c.term.options.theme = theme;
+  c.term.options.theme = c.theme = theme;
 }
 
 // Set both options together, without fitting — attach() calls this because it fits immediately
 // after, and setFont() because it fits itself. Splitting them would fit twice for one change.
 function applyFont(c: Conn, font: TerminalFont): void {
   c.font = font;
-  c.term.options.fontSize = font.size;
-  c.term.options.fontFamily = font.family;
+  Object.assign(c.term.options, { fontSize: font.size, fontFamily: font.family });
 }
 
 // Unlike setTheme, this changes the CELL METRICS — a different size or a different face means a
@@ -1041,9 +1035,7 @@ export function setFont(key: string, font: TerminalFont) {
 // grid cell that kept the old speed would look like the setting only half worked. The alternate
 // buffer's wheel handler reads the same value per event, so it needs no push.
 export function setScrollSpeed(speed: number) {
-  conns.forEach((c) => {
-    c.term.options.scrollSensitivity = speed;
-  });
+  conns.forEach((c) => (c.term.options.scrollSensitivity = speed));
 }
 
 // Watched here, at module scope, rather than in Terminal.vue the way the font is: the font is a
