@@ -50,4 +50,10 @@ describe("createAppendFileCache", () => {
     expect(c.resume("b", stamp(1, 1))).toBeUndefined();
     expect(c.resume("c", stamp(1, 1))).toEqual({ from: 1, value: "c" });
   });
+  it("invalidates an atomic file replacement and a shrink below the scanned offset", () => {
+    const cache = createAppendFileCache<string>();
+    cache.set("a", { mtimeMs: 1, size: 10, dev: 1, ino: 10 }, 20, "read during append");
+    expect(cache.resume("a", { mtimeMs: 2, size: 30, dev: 1, ino: 11 })).toBeUndefined();
+    expect(cache.resume("a", { mtimeMs: 2, size: 15, dev: 1, ino: 10 })).toBeUndefined();
+  });
 });

@@ -89,6 +89,8 @@ function mountCell(
     zoomed?: boolean;
     reorderable?: boolean;
     initialAgent?: "claude" | "codex" | "antigravity" | "grok";
+    reviewPending?: boolean;
+    phone?: boolean;
   } = {},
 ) {
   return mount(TerminalCell, {
@@ -100,12 +102,14 @@ function mountCell(
       reorderable: opts.reorderable ?? false,
       initialSessionId,
       initialCwd: opts.initialCwd ?? null,
+      reviewPending: opts.reviewPending ?? false,
       defaultCwd: opts.defaultCwd ?? "/home/me/my-project",
       presets: opts.presets ?? [],
       home: opts.home ?? "/home/me",
       cancellable: opts.cancellable ?? false,
       openSessionIds: opts.openSessionIds ?? [],
       openCwds: opts.openCwds ?? [],
+      phone: opts.phone ?? false,
     },
   });
 }
@@ -136,6 +140,16 @@ const WORKSPACE = "/home/me/ws";
 const mountProjectCell = (dir: string) => mountCell(null, { initialCwd: dir, defaultCwd: WORKSPACE });
 
 describe("TerminalCell", () => {
+  it("shows and toggles the persisted review marker", async () => {
+    const id = "11111111-1111-1111-1111-111111111111";
+    const pending = mountCell(id, { reviewPending: true });
+    await flushPromises();
+    expect(pending.get('[data-testid="cell-review-badge"]').text()).toBe("review");
+    const toggle = pending.get('[data-testid="cell-review-toggle"]');
+    expect(toggle.attributes("aria-pressed")).toBe("true");
+    await toggle.trigger("click");
+    expect(pending.emitted("review-pending")?.at(-1)).toEqual([false]);
+  });
   // #965: the whole cell — header included — sits in one wrapper, so the focus zoom can be
   // cancelled about the cell's own centre. A second element child, or content left outside the
   // wrapper, would scale with the frame and resample the terminal's canvas.
@@ -717,7 +731,7 @@ describe("TerminalCell", () => {
     expect(dotClass(w)).toContain("is-idle"); // the newest seed wins, not the first to resolve
   });
 
-  it("shows a token-usage badge from /api/session/:id", async () => {
+  it("shows a token-usage badge for agents that keep it in the pane header", async () => {
     const id = "55555555-5555-5555-5555-555555555555";
     globalThis.fetch = vi.fn(async (url: string) => {
       const u = String(url);
@@ -733,12 +747,34 @@ describe("TerminalCell", () => {
         }),
       };
     }) as unknown as typeof fetch;
-    const w = mountCell(id);
+    const w = mountCell(id, { initialAgent: "antigravity" });
     await flushPromises();
     const badge = w.find('[data-testid="cell-usage"]');
     expect(badge.exists()).toBe(true);
     expect(badge.text()).toContain("2.0k"); // input 1200 + cacheRead 800 = 2000
     expect(badge.text()).toContain("3.4k"); // output 3400
+  });
+
+  it.each(["claude", "codex"] as const)("hides the token-usage badge for %s", async (initialAgent) => {
+    const id = "55555555-5555-5555-5555-555555555555";
+    globalThis.fetch = vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u.includes("/api/scripts")) return { ok: true, json: async () => ({ cwd: "/p", scripts: [] }) };
+      if (u.includes("/api/sessions")) return { ok: true, json: async () => ({ sessions: [] }) };
+      return {
+        ok: true,
+        json: async () => ({
+          working: false,
+          waiting: false,
+          lastPrompt: null,
+          usage: { inputTokens: 1200, outputTokens: 3400, cacheReadTokens: 800, cacheCreationTokens: 0 },
+        }),
+      };
+    }) as unknown as typeof fetch;
+
+    const w = mountCell(id, { initialAgent });
+    await flushPromises();
+    expect(w.find('[data-testid="cell-usage"]').exists()).toBe(false);
   });
 
   // Codex on #642: a guard that only skips an unrenderable payload leaves the badge showing
@@ -754,7 +790,7 @@ describe("TerminalCell", () => {
       if (u.includes("/api/sessions")) return { ok: true, json: async () => ({ sessions: [] }) };
       return { ok: true, json: async () => ({ working: false, waiting: false, lastPrompt: null, usage }) };
     }) as unknown as typeof fetch;
-    const w = mountCell(id);
+    const w = mountCell(id, { initialAgent: "antigravity" });
     await flushPromises();
     expect(w.find('[data-testid="cell-usage"]').exists()).toBe(true);
 
@@ -770,31 +806,35 @@ describe("TerminalCell", () => {
 
   // #620, on the badge path: two turns end back-to-back, so two /api/session reads for the
   // same session are in flight at once. The older one resolving last must not put the
-  // previous turn's token numbers back on the badge.
-  it("does not let a stale usage refresh clobber a newer one (out-of-order)", async () => {
+  // previous turn's model back on the badge.
+  it("does not let a stale badge refresh clobber a newer one (out-of-order)", async () => {
     const id = "66666666-6666-6666-6666-666666666666";
     const gates = [deferred<boolean>(), deferred<boolean>()];
     let sessionCall = 0;
-    const INITIAL = { inputTokens: 100, outputTokens: 100, cacheReadTokens: 0, cacheCreationTokens: 0 };
-    const OLD = { inputTokens: 1000, outputTokens: 2000, cacheReadTokens: 0, cacheCreationTokens: 0 };
-    const NEW = { inputTokens: 5000, outputTokens: 9000, cacheReadTokens: 0, cacheCreationTokens: 0 };
+    const badge = (model: string, contextTokens: number) => ({
+      usage: { inputTokens: contextTokens, outputTokens: contextTokens, cacheReadTokens: 0, cacheCreationTokens: 0 },
+      context: { model, contextTokens, contextWindow: 10_000 },
+    });
+    const INITIAL = badge("claude-opus-4-8", 100);
+    const OLD = badge("claude-haiku-4", 1000);
+    const NEW = badge("claude-sonnet-4-6", 5000);
     globalThis.fetch = vi.fn(async (url: string) => {
       const u = String(url);
       if (u.includes("/api/scripts")) return { ok: true, json: async () => ({ cwd: "/p", scripts: [] }) };
       if (u.includes("/api/sessions")) return { ok: true, json: async () => ({ sessions: [] }) };
       if (u.includes(`/api/session/${id}`)) {
         const n = sessionCall++;
-        if (n === 0) return { ok: true, json: async () => ({ working: false, waiting: false, lastPrompt: null, usage: INITIAL }) }; // mount seed
-        const usage = n === 1 ? OLD : NEW; // refresh #1 = older turn, refresh #2 = newer turn
+        if (n === 0) return { ok: true, json: async () => ({ working: false, waiting: false, lastPrompt: null, ...INITIAL }) }; // mount seed
+        const badges = n === 1 ? OLD : NEW; // refresh #1 = older turn, refresh #2 = newer turn
         await gates[n - 1].promise;
-        return { ok: true, json: async () => ({ working: false, waiting: false, lastPrompt: null, usage }) };
+        return { ok: true, json: async () => ({ working: false, waiting: false, lastPrompt: null, ...badges }) };
       }
       return { ok: true, json: async () => ({ working: false, waiting: false, lastPrompt: null }) };
     }) as unknown as typeof fetch;
 
     const w = mountCell(id);
     await flushPromises();
-    expect(w.find('[data-testid="cell-usage"]').text()).toContain("100"); // initial seed
+    expect(w.find('[data-testid="model-badge"]').text()).toBe("Opus"); // initial seed
 
     // First turn ends → refresh #1 (older), held on gates[0].
     captured?.({ id, working: true, waiting: false });
@@ -813,10 +853,9 @@ describe("TerminalCell", () => {
     await flushPromises();
     await nextTick();
 
-    const badge = w.find('[data-testid="cell-usage"]').text();
-    expect(badge).toContain("5.0k"); // NEW input
-    expect(badge).toContain("9.0k"); // NEW output
-    expect(badge).not.toContain("1.0k"); // not OLD input
+    const modelBadge = w.find('[data-testid="model-badge"]').text();
+    expect(modelBadge).toBe("Sonnet"); // NEW model
+    expect(modelBadge).not.toBe("Haiku"); // not OLD model
   });
 
   it("shows the model/context badge from /api/session/:id context", async () => {
@@ -834,7 +873,7 @@ describe("TerminalCell", () => {
     await flushPromises();
     const badge = w.find('[data-testid="model-badge"]');
     expect(badge.exists()).toBe(true);
-    expect(badge.text()).toBe("Opus · ctx 35%"); // 70k / 200k
+    expect(badge.text()).toBe("Opus");
   });
 
   // An agy cell is the case that has no other way back: agy mints its conversation id after the
@@ -970,7 +1009,7 @@ describe("TerminalCell", () => {
         }),
       };
     }) as unknown as typeof fetch;
-    const w = mountCell(id, { initialCwd: "/home/me/proj" });
+    const w = mountCell(id, { initialCwd: "/home/me/proj", initialAgent: "antigravity" });
     await flushPromises();
     expect(w.find('[data-testid="cell-hdr-chip"]').text()).toBe("prod"); // custom chip renders its substituted text
     expect(w.find('[data-testid="cell-usage"]').exists()).toBe(true); // usage is listed
@@ -1005,7 +1044,7 @@ describe("TerminalCell", () => {
         }),
       };
     }) as unknown as typeof fetch;
-    const w = mountCell(id, { initialCwd: "/home/me/proj" });
+    const w = mountCell(id, { initialCwd: "/home/me/proj", initialAgent: "antigravity" });
     await flushPromises();
     expect(w.findAll('[data-testid="cell-usage"]')).toHaveLength(2); // both duplicates render, unique keys → no collision
   });
@@ -1810,7 +1849,14 @@ describe("TerminalCell", () => {
     const w = mountCell("11111111-1111-1111-1111-111111111111", { initialCwd: "/home/me/proj", reorderable: true });
     await flushPromises();
     const labels = w.findAll(".cell-header > .cell-actions button").map((b) => b.attributes("aria-label"));
-    expect(labels).toEqual(["Move terminal left", "Move terminal right", "Expand terminal", "Set aside (stays open, keeps its history)", "Close terminal"]);
+    expect(labels).toEqual([
+      "Mark as review waiting",
+      "Move terminal left",
+      "Move terminal right",
+      "Expand terminal",
+      "Set aside (stays open, keeps its history)",
+      "Close terminal",
+    ]);
   });
 
   it("drops reorder when the grid is not reorderable", async () => {
@@ -2531,5 +2577,68 @@ describe("TerminalCell launch target — the OS default shell (#1114)", () => {
     expect(w.find('[data-testid="cell-model-help"]').exists()).toBe(false);
     await pick(w, "claude");
     expect(w.find('[data-testid="cell-model-help"]').exists()).toBe(true);
+  });
+});
+
+// The phone keeps ONE row of cell chrome. Two rows were 73 of 844 pixels above a terminal that is
+// the entire reason that screen is open, and the second of them is the terminal's own toolbar —
+// Skill, attachments, the tool chips — every one of which opens something that has nowhere to go
+// on a 390px screen.
+describe("TerminalCell (phone)", () => {
+  const SESSION = "11111111-1111-1111-1111-111111111111";
+
+  it("hides the terminal's own header row", () => {
+    const w = mountCell(SESSION, { expanded: true, zoomed: true, phone: true });
+    expect(w.findComponent({ name: "TerminalView" }).props("hideHeader")).toBe(true);
+  });
+
+  it("keeps it on the desktop", () => {
+    const w = mountCell(SESSION, { expanded: true, zoomed: true });
+    expect(w.findComponent({ name: "TerminalView" }).props("hideHeader")).toBe(false);
+  });
+
+  // What survives: the note, review-waiting, and the way back. The move buttons go with the rest —
+  // they arrange a grid the phone never draws.
+  it("leaves only the note, review-waiting and the way back", () => {
+    const w = mountCell(SESSION, { expanded: true, zoomed: true, reorderable: true, phone: true });
+    const labels = w.findAll("button").map((b) => b.attributes("aria-label") ?? "");
+    expect(labels).toEqual(expect.arrayContaining(["Add a note to this session", "Mark as review waiting", "Restore terminal"]));
+    expect(labels).not.toContain("Move terminal left");
+    expect(labels).not.toContain("Close terminal");
+  });
+});
+
+// The shared grid can move a different session into this cell (another browser's snapshot lands
+// on the uid this cell is keyed by). The cell follows it in place — and must follow the AGENT too:
+// the picker still says what this cell was launched as, while the session that arrived may be
+// another agent's. Following only the id opened `/ws/codex` with a claude id; the server refuses
+// that now and mints a fresh codex session, which the grid then drops as a stale report, and the
+// cell ends up showing one session while holding another.
+describe("following a session the shared grid moved into this cell", () => {
+  const A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+  it("switches to the new session with the agent the cell now records", async () => {
+    const w = mountCell(A, { initialAgent: "codex" });
+    await w.setProps({ initialSessionId: B, initialAgent: undefined }); // the cell now holds a claude session
+    const term = w.findComponent({ name: "TerminalView" });
+    expect(term.props("sessionId")).toBe(B);
+    expect(term.attributes("agent")).toBe("claude");
+    expect(w.emitted("agent")?.at(-1)).toEqual(["claude"]);
+  });
+
+  it("follows a codex session arriving in a claude cell the same way", async () => {
+    const w = mountCell(A);
+    await w.setProps({ initialSessionId: B, initialAgent: "codex" });
+    const term = w.findComponent({ name: "TerminalView" });
+    expect(term.props("sessionId")).toBe(B);
+    expect(term.attributes("agent")).toBe("codex");
+    expect(w.emitted("agent")?.at(-1)).toEqual(["codex"]);
+  });
+
+  it("does not switch for a cleared session, which is a close or relaunch the cell drives itself", async () => {
+    const w = mountCell(A, { initialAgent: "codex" });
+    await w.setProps({ initialSessionId: null });
+    expect(w.findComponent({ name: "TerminalView" }).props("sessionId")).toBe(A);
   });
 });

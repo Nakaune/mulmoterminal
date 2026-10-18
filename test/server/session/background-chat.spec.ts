@@ -1,6 +1,9 @@
 // @vitest-environment node
-import { describe, it, expect } from "vitest";
-import { backgroundChatMessage, parseBackgroundChat, spawnModeFor } from "../../../server/session/background-chat.js";
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { backgroundChatMessage, parseBackgroundChat, resolveSpawnCwd, spawnModeFor } from "../../../server/session/background-chat.js";
 
 const SESSION = "11111111-2222-3333-4444-555555555555";
 const ok = (body: unknown) => {
@@ -128,5 +131,79 @@ describe("backgroundChatMessage", () => {
     ] as const) {
       expect(backgroundChatMessage(agent, draft, SESSION)).toContain(SESSION);
     }
+  });
+});
+
+describe("parseBackgroundChat cwd", () => {
+  it("keeps an absolute path and leaves it absent otherwise", () => {
+    expect(ok({ message: "go", cwd: "/home/u/repo" }).cwd).toBe("/home/u/repo");
+    expect(ok({ message: "go" }).cwd).toBeUndefined();
+  });
+
+  it("drops a relative path, a non-string and an empty string", () => {
+    for (const cwd of ["repo", "./repo", "../repo", "", 42, null, ["/abs"], { path: "/abs" }]) {
+      expect(ok({ message: "go", cwd }).cwd).toBeUndefined();
+    }
+  });
+});
+
+describe("resolveSpawnCwd", () => {
+  let tmp: string;
+  let base: string;
+  let clone: string;
+  let outside: string;
+  const fail = async (cwd: string, roots: string[]) => {
+    const r = await resolveSpawnCwd(cwd, roots);
+    expect(r.ok).toBe(false);
+    return r.ok ? "" : r.message;
+  };
+
+  beforeAll(() => {
+    tmp = realpathSync(mkdtempSync(path.join(os.tmpdir(), "bgchat-cwd-")));
+    base = path.join(tmp, "base");
+    clone = path.join(tmp, "clone");
+    outside = path.join(tmp, "outside");
+    [base, path.join(base, "sub"), clone, path.join(clone, "pkg"), outside].forEach((d) => mkdirSync(d, { recursive: true }));
+    symlinkSync(outside, path.join(base, "escape"));
+    writeFileSync(path.join(base, "file.txt"), "x");
+  });
+  afterAll(() => rmSync(tmp, { recursive: true, force: true }));
+
+  it("passes the default cwd itself and a directory under it", async () => {
+    expect(await resolveSpawnCwd(base, [base])).toEqual({ ok: true, cwd: base });
+    expect(await resolveSpawnCwd(path.join(base, "sub"), [base])).toEqual({ ok: true, cwd: path.join(base, "sub") });
+  });
+
+  it("passes a known clone and a directory under it", async () => {
+    expect(await resolveSpawnCwd(clone, [base, clone])).toEqual({ ok: true, cwd: clone });
+    expect(await resolveSpawnCwd(path.join(clone, "pkg"), [base, clone])).toEqual({ ok: true, cwd: path.join(clone, "pkg") });
+  });
+
+  it("refuses a directory that is neither under the default nor a known clone", async () => {
+    expect(await fail(outside, [base, clone])).toMatch(/neither inside/);
+  });
+
+  it("does not treat a sibling that merely shares a name prefix as inside", async () => {
+    const sibling = `${base}-other`;
+    mkdirSync(sibling);
+    expect(await fail(sibling, [base])).toMatch(/neither inside/);
+  });
+
+  it("refuses a path that does not exist, and one that is a file", async () => {
+    expect(await fail(path.join(base, "missing"), [base])).toMatch(/not an existing directory/);
+    expect(await fail(path.join(tmp, "nope", "deeper"), [tmp])).toMatch(/not an existing directory/);
+    expect(await fail(path.join(base, "file.txt"), [base])).toMatch(/not an existing directory/);
+  });
+
+  it("refuses a symlink under an allowed tree that leads outside it", async () => {
+    expect(await fail(path.join(base, "escape"), [base])).toMatch(/neither inside/);
+  });
+
+  it("refuses a '..' path that climbs out of an allowed tree", async () => {
+    expect(await fail(path.join(base, "sub", "..", "..", "outside"), [base])).toMatch(/neither inside/);
+  });
+
+  it("ignores an allowed root that no longer exists", async () => {
+    expect(await fail(outside, [path.join(tmp, "gone")])).toMatch(/neither inside/);
   });
 });

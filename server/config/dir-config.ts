@@ -19,6 +19,7 @@ import {
 import { resolveFileWithinDir } from "./dir-file.js";
 import { resolveDirIcon, dirIconImage, dirIconNamed, dirIconRef, type DirIcon, type DirIconSetting } from "./dir-icon.js";
 import { detectDirIcon } from "./dir-icon-detect.js";
+import { dirIdentityFor } from "./auto-dir-color.js";
 import { getAutoDirIcon } from "./config-routes.js";
 import { DIR_ICON_ROUTE } from "../../common/dirIcon.js";
 import { readJsonFile } from "../infra/read-text-file.js";
@@ -248,24 +249,10 @@ export function loadDirConfig(cwd: string): DirConfig {
 }
 
 export function publicDirConfig(cwd: string): PublicDirConfig {
-  const {
-    name,
-    badgeColor,
-    headerColor,
-    headerTextColor,
-    cellColor,
-    cellBorderColor,
-    dotColor,
-    buttonColor,
-    fontSize,
-    fontFamily,
-    orderPriority,
-    theme,
-    colors,
-    sound,
-    sounds,
-    icon,
-  } = loadDirConfig(cwd);
+  const own = loadDirConfig(cwd);
+  // LOCAL FORK: a directory that names no colour takes its repository's — see auto-dir-color.
+  const { name, badgeColor, headerColor, headerTextColor, cellColor, cellBorderColor, dotColor, buttonColor } = dirIdentityFor(cwd, own, loadDirConfig);
+  const { fontSize, fontFamily, orderPriority, theme, colors, sound, sounds, icon } = own;
   return {
     name,
     badgeColor,

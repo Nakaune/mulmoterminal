@@ -50,6 +50,7 @@ export interface Cell {
   // way (#992). Stored as the ABSENCE of the key when not parked, for the same reason `agent`
   // is — only an absent key survives the JSON a persisted cell round-trips.
   parked?: true;
+  reviewPending?: true;
 }
 // How the grid orders its cells. "manual": the user's hand-arranged order (the move buttons);
 // "auto": attention-first, recomputed from each cell's live status; "priority": the rank each
@@ -109,9 +110,42 @@ export function cancelableLaunchUid(state: GridState): number | null {
 }
 
 export function setSession(state: GridState, uid: number, id: string | null): GridState {
-  const cells = state.cells.map((c) => (c.uid === uid ? { ...c, session: id } : c));
+  const cells = state.cells.map((c) => {
+    if (c.uid !== uid) return c;
+    if (c.session === id) return { ...c, session: id };
+    const { reviewPending: _reviewPending, ...withoutReview } = c;
+    return { ...withoutReview, session: id };
+  });
   const expanded = id === null && state.expanded === uid ? null : state.expanded;
   return { ...state, cells, expanded };
+}
+
+/**
+ * A terminal reported the session it is attached to. `prior` is the id it was attached FOR (null
+ * for a fresh launch). The report is taken when the cell asked for it: the cell is launching
+ * (session null), already holds the id, or still holds `prior` (the server minted a fresh id for
+ * what the cell requested). Anything else is a terminal still bound to a session this cell no
+ * longer holds — the shared grid moved that session to another cell — and writing it back would
+ * clone it into this cell and erase the one the snapshot put here (seen 2026-10-01). The cell
+ * component follows its new session on its own; the stale report is simply not state.
+ */
+export function setReportedSession(state: GridState, uid: number, id: string, prior: string | null): GridState {
+  const cell = state.cells.find((c) => c.uid === uid);
+  if (!cell) return state;
+  if (cell.session !== null && cell.session !== id && cell.session !== prior) return state;
+  return setSession(state, uid, id);
+}
+
+export function setReviewPending(state: GridState, uid: number, pending: boolean): GridState {
+  return {
+    ...state,
+    cells: state.cells.map((c) => {
+      if (c.uid !== uid) return c;
+      if (pending) return { ...c, reviewPending: true };
+      const { reviewPending: _reviewPending, ...withoutReview } = c;
+      return withoutReview;
+    }),
+  };
 }
 
 export function setCwd(state: GridState, uid: number, cwd: string): GridState {
@@ -502,7 +536,21 @@ const isCell = (c: unknown): c is Cell => {
   return sessionOk && (c.cwd === null || typeof c.cwd === "string");
 };
 
-export function parseGridState(raw: string | null): GridState | null {
+export interface ParseGridStateOptions {
+  /** Keep the persisted uids instead of renumbering from position. The shared grid needs this:
+   *  every browser keys its MOUNTED cells by uid, so a snapshot that renumbered would hand each
+   *  live terminal a different cell's session (it then reported its own id into that cell, and
+   *  one session was cloned over another — 2026-10-01). Falls back to renumbering when the
+   *  persisted uids are not distinct safe integers, which is the only case renumbering protects
+   *  against. Off (a reload from storage): nothing is mounted yet, so position is the safe key. */
+  keepUids?: boolean;
+}
+
+// Far below MAX_SAFE_INTEGER so nextUid can keep counting from the largest kept uid.
+const UID_LIMIT = 2 ** 40;
+const isUsableUid = (u: unknown): u is number => typeof u === "number" && Number.isSafeInteger(u) && u >= 0 && u < UID_LIMIT;
+
+export function parseGridState(raw: string | null, options: ParseGridStateOptions = {}): GridState | null {
   try {
     const parsed: unknown = JSON.parse(raw ?? "");
     if (!isRecord(parsed) || !isUnknownArray(parsed.cells)) return null;
@@ -511,11 +559,14 @@ export function parseGridState(raw: string | null): GridState | null {
     // uids from position. Persisted uids are untrusted: duplicates would collide
     // v-for keys, and a near-MAX_SAFE_INTEGER value would overflow the nextUid
     // counter. uid is internal identity only, so a clean 0..n-1 space (nextUid =
-    // count) is always safe and in range.
+    // count) is always safe and in range. `keepUids` is the one caller that
+    // needs the persisted numbers (see ParseGridStateOptions).
     const running = parsed.cells
       .filter(isCell)
       .filter((c) => c.session !== null)
       .slice(0, MAX_TERMINALS);
+    const persistedUids = running.map((c) => c.uid);
+    const keep = options.keepUids === true && persistedUids.every(isUsableUid) && new Set(persistedUids).size === persistedUids.length;
     // Every field a cell keeps across a reload is named HERE — a persisted key this literal does
     // not rebuild is dropped silently, with nothing to typecheck against.
     const cells: Cell[] = running.map((c, i) => {
@@ -523,18 +574,24 @@ export function parseGridState(raw: string | null): GridState | null {
       // exactOptionalPropertyTypes a key holding undefined is not the same as no key.
       const agent = storedCellAgent(asTerminalAgent(c.agent));
       return {
-        uid: i,
+        uid: keep ? c.uid : i,
         session: c.session,
         cwd: c.cwd,
         launcher: asLauncher(c.launcher),
         ...(agent === undefined ? {} : { agent }),
         ...(c.parked === true ? { parked: true as const } : {}),
+        ...(c.reviewPending === true ? { reviewPending: true as const } : {}),
       };
     });
     const expandedIdx = running.findIndex((c) => c.uid === storedExpanded);
-    const expanded = typeof storedExpanded === "number" && expandedIdx >= 0 ? expandedIdx : null;
+    let expanded: number | null = null;
+    if (typeof storedExpanded === "number" && expandedIdx >= 0) expanded = keep ? storedExpanded : expandedIdx;
     const page = typeof storedPage === "number" && Number.isSafeInteger(storedPage) && storedPage >= 0 ? storedPage : 0;
-    return clampPage(ensureEntry({ cells, expanded, page, nextUid: cells.length, sortMode: asSortMode(parsed.sortMode) }));
+    // Kept uids count on from the largest one (and from the persisted counter, so a uid freed by a
+    // close is not handed out again while another browser may still show it).
+    const persistedNext = isUsableUid(parsed.nextUid) ? parsed.nextUid : 0;
+    const nextUid = keep ? Math.max(persistedNext, ...persistedUids.map((u) => u + 1)) : cells.length;
+    return clampPage(ensureEntry({ cells, expanded, page, nextUid, sortMode: asSortMode(parsed.sortMode) }));
   } catch {
     return null;
   }

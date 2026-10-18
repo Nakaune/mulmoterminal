@@ -6,9 +6,9 @@
 // Ordered roughly along the lifecycle so the client can pick a colour/label per phase.
 // `none` = no PR for this branch yet (still local work); `ready` = open, CI green, no
 // changes requested — i.e. waiting to merge.
-export type PrPhase = "none" | "draft" | "ci-failing" | "changes-requested" | "ci-running" | "ready" | "merged" | "closed";
+export type PrPhase = "none" | "draft" | "conflict" | "ci-failing" | "changes-requested" | "ci-running" | "ready" | "merged" | "closed";
 
-export const PR_PHASES: readonly PrPhase[] = ["none", "draft", "ci-failing", "changes-requested", "ci-running", "ready", "merged", "closed"];
+export const PR_PHASES: readonly PrPhase[] = ["none", "draft", "conflict", "ci-failing", "changes-requested", "ci-running", "ready", "merged", "closed"];
 
 export const isPrPhase = (v: unknown): v is PrPhase => typeof v === "string" && PR_PHASES.some((phase) => phase === v);
 

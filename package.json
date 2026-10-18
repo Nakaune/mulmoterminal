@@ -40,7 +40,7 @@
     "dev": "concurrently -n server,vite -c blue,green \"node scripts/dev-server.mjs\" \"vite\"",
     "dev:server": "node scripts/dev-server.mjs",
     "dev:client": "vite",
-    "build": "vue-tsc -b && vite build",
+    "build": "vue-tsc -b && vite build && node scripts/verify-local-hotfix-build.mjs",
     "typecheck": "vue-tsc -b",
     "lint": "eslint .",
     "format": "prettier --write .",

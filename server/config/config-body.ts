@@ -20,6 +20,7 @@ export const ARRAY_FIELDS = [
   "launchers",
   "customAgents",
   "quickCommands",
+  "toolbarLinks",
   "pushKinds",
   "soundKinds",
   "userMcpServers",

@@ -20,7 +20,31 @@ export interface ReapGraces {
 
 export type ReapDecision = { kind: "keep" } | { kind: "arm"; delayMs: number };
 
-export function reapDecisionFor(activity: ReapActivity | undefined, graces: ReapGraces): ReapDecision {
+/** The close code `ws` reports for a socket that did not close but BROKE — no close frame
+ *  ever arrived (the machine slept, the wifi went, the tunnel died). A browser that is done
+ *  with a session sends one first, whether the tab was closed or the cell left the roster,
+ *  so this code is the only thing that tells "the user finished with this session" apart
+ *  from "the user is cut off from it". */
+export const ABNORMAL_CLOSURE = 1006;
+
+/** Did the connection break, rather than the client ask to close? An absent code counts as
+ *  deliberate: every caller that never carried one was closing on purpose. */
+export function isConnectionDrop(closeCode: number | undefined): boolean {
+  return closeCode === ABNORMAL_CLOSURE;
+}
+
+export interface ReapContext {
+  /** No authoritative activity has been observed yet; absence is not idleness. */
+  activityUnknown?: boolean;
+  /** The socket broke instead of closing. Reaping then kills a live agent because the
+   *  network blinked — the one cause the user can neither see coming nor undo. Over
+   *  loopback this effectively never happens; over a tunnel it is routine. */
+  connectionDropped?: boolean;
+}
+
+export function reapDecisionFor(activity: ReapActivity | undefined, graces: ReapGraces, context: ReapContext = {}): ReapDecision {
+  if (context.activityUnknown) return { kind: "keep" };
+  if (context.connectionDropped) return { kind: "keep" }; // cut off, not closed — see ABNORMAL_CLOSURE
   if (activity?.waiting) return { kind: "arm", delayMs: graces.waitingMs };
   if (activity?.working) return { kind: "keep" }; // clearly working, don't close it
   return { kind: "arm", delayMs: graces.idleMs };

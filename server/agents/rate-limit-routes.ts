@@ -13,6 +13,7 @@ import { readClaudeStatus } from "./statusline.js";
 import { currentClaudeLimits } from "./rate-limit-store.js";
 import type { ProbeState } from "./rate-limit-store.js";
 import type { RateLimitSnapshot, RateLimitStore } from "./rate-limit-store.js";
+import type { RateLimits, ScopedRateLimitWindow } from "../../common/rateLimits.js";
 
 export interface RateLimitRouteDeps {
   store: RateLimitStore;
@@ -23,6 +24,10 @@ export interface RateLimitRouteDeps {
   /** Whether `claude` could be launched right now — a PATH lookup, not a spawn. Asked on every
    *  poll so the "not installed" state can clear itself when one appears (#1019). */
   claudeAvailable: () => boolean;
+  /** Claude's per-model weekly windows, re-read from disk. Free, like the Codex refresh, so it
+   *  happens on every read rather than being held in the store — the store's job is the readings
+   *  a probe had to be spent on. */
+  claudeScopedWindows: (now_ms: number) => ScopedRateLimitWindow[];
   now_ms: () => number;
 }
 
@@ -50,11 +55,12 @@ export function mountRateLimitRoutes(app: Express, deps: RateLimitRouteDeps): vo
         deps.store.setProbeInFlight(false);
       }
     }
-    res.json(snapshotBody(deps.store.snapshot(), deps.store.isProbing(), deps.store.probeState(), now));
+    res.json(snapshotBody(deps.store.snapshot(), deps.store.isProbing(), deps.store.probeState(), now, deps.claudeScopedWindows(now)));
   });
 
   app.get("/api/rate-limits", (_req, res) => {
-    res.json(snapshotBody(deps.store.snapshot(), deps.store.isProbing(), deps.store.probeState(), deps.now_ms()));
+    const now = deps.now_ms();
+    res.json(snapshotBody(deps.store.snapshot(), deps.store.isProbing(), deps.store.probeState(), now, deps.claudeScopedWindows(now)));
   });
 }
 
@@ -76,8 +82,17 @@ export function mountRateLimitRoutes(app: Express, deps: RateLimitRouteDeps): vo
 // Claude's windows go through `currentClaudeLimits`, which drops a reading too old to vouch for.
 // The client needs no rule of its own for that — with no windows to draw it already explains the
 // gap from `claudeProbe` (#1293).
-const snapshotBody = (snapshot: RateLimitSnapshot, probing: boolean, state: ProbeState, now_ms: number) => ({
-  claude: currentClaudeLimits(snapshot, now_ms),
+//
+// The per-model windows are attached to the Claude reading rather than sent beside it, and only
+// when there IS one: they are the same account's budget seen a second way, so `5h 9% · 7d 45% ·
+// fable 74%` is one row that reads left to right. Sending them when the account windows are
+// missing would put a lone percentage next to "claude usage n/a" — a figure with nothing to say
+// what it is a fraction of, beside a line saying we cannot see the usage.
+const withScoped = (limits: RateLimits | null, scoped: readonly ScopedRateLimitWindow[]): RateLimits | null =>
+  limits && scoped.length ? { ...limits, scoped: [...scoped] } : limits;
+
+const snapshotBody = (snapshot: RateLimitSnapshot, probing: boolean, state: ProbeState, now_ms: number, scoped: readonly ScopedRateLimitWindow[]) => ({
+  claude: withScoped(currentClaudeLimits(snapshot, now_ms), scoped),
   codex: snapshot.codex?.limits ?? null,
   probing,
   claudeProbe: state.kind,

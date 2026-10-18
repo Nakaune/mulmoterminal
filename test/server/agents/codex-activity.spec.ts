@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, it, expect } from "vitest";
-import { nextReadRange, takeCompleteLines, turnBoundaries, boundaryOutcome, HOOK_EVENT_FOR } from "../../../server/agents/codex-activity.js";
+import { nextReadRange, takeCompleteLines, turnBoundaries, explicitWorkdirs, boundaryOutcome, HOOK_EVENT_FOR } from "../../../server/agents/codex-activity.js";
 
 const line = (o: unknown) => JSON.stringify(o);
 const started = (turnId = "t1") => line({ type: "event_msg", payload: { type: "task_started", turn_id: turnId } });
@@ -9,7 +9,9 @@ const aborted = (turnId = "t1") => line({ type: "event_msg", payload: { type: "t
 const agentMessage = () => line({ type: "event_msg", payload: { type: "agent_message", message: "thinking" } });
 // A turn_context row carries a turn_id but no payload.type — the shape most likely to be
 // misread as a boundary.
-const turnContext = (turnId = "t1") => line({ type: "turn_context", payload: { turn_id: turnId, cwd: "/w" } });
+const execCwd = (cwd: string) =>
+  line({ type: "response_item", payload: { type: "custom_tool_call", name: "exec", input: `tools.exec_command({cmd:"pwd",workdir:"${cwd}"})` } });
+const turnContext = () => line({ type: "turn_context", payload: { cwd: "/w" } });
 
 describe("nextReadRange", () => {
   it("reads the appended bytes when the file grew", () => {
@@ -99,6 +101,26 @@ describe("turnBoundaries", () => {
 
   it("is empty for no lines", () => {
     expect(turnBoundaries([])).toEqual([]);
+  });
+});
+
+describe("explicitWorkdirs", () => {
+  it("extracts explicit workdirs from real exec records", () => {
+    expect(
+      explicitWorkdirs([
+        execCwd("/w"),
+        line({ type: "response_item", payload: { type: "custom_tool_call", name: "exec", input: 'tools.exec_command({"cmd":"apply_patch workdir /bad"})' } }),
+        line({ type: "turn_context", payload: { cwd: "/no" } }),
+        "{malformed",
+      ]),
+    ).toEqual(["/w"]);
+  });
+  it("accepts quoted workdir keys too", () => {
+    expect(
+      explicitWorkdirs([
+        line({ type: "response_item", payload: { type: "custom_tool_call", name: "exec", input: 'tools.exec_command({"workdir":"/quoted"})' } }),
+      ]),
+    ).toEqual(["/quoted"]);
   });
 });
 

@@ -15,12 +15,18 @@ import type { ToolCall, ToolResult } from "./types.js";
 import { reconcileCollectionCard } from "../../common/collectionSeed.js";
 import { isUnknownArray } from "../../common/isUnknownArray.js";
 import { isRecord } from "../../common/isRecord.js";
+import { foldSessionPr, isSessionPr, prFromToolOutput, sortedSessionPrs, type SessionPr } from "../../common/sessionPr.js";
+import { createCodexPrReader } from "./codex-session-pr.js";
 
 export interface ToolStoreDeps {
   /** Fan a change out to the panel; a no-op before pub/sub exists. */
   publish: (channel: string, data: unknown) => void;
   /** Where the JSON files live. Defaults to ~/.mulmoterminal. */
   root?: string;
+  /** This session's Codex rollout file, or null when it is not a Codex session. Codex sends no
+   *  tool events — no hook, no MCP — so its requests can only be read off the rollout. Optional so
+   *  a test can build the stores without a filesystem full of rollouts. */
+  codexRolloutFile?: (sessionId: string) => string | null | Promise<string | null>;
 }
 
 // The file's mtime, or 0 when there is no readable file.
@@ -166,7 +172,69 @@ const isToolCall = (value: unknown): value is ToolCall =>
   (value.toolName === undefined || typeof value.toolName === "string") &&
   (value.durationMs === undefined || typeof value.durationMs === "number");
 
-export function createToolStores({ publish, root = MULMOTERMINAL_HOME }: ToolStoreDeps) {
+// The pull requests one session opened or changed, kept beside the call history under
+// ~/.mulmoterminal/sessionprs.
+//
+// A store of its own rather than an answer derived from the call history on demand, and the reason
+// is TOOLCALLS_LIMIT: a session is trimmed to its last 200 calls, so a request opened at the top of
+// a long session would drop out of a derived answer while the session is still working on it —
+// which is exactly the session the chip exists for.
+//
+// Outside createToolStores because it reads that function's toolCallsStore and nothing else, so
+// passing it in says so — and keeps the factory readable at a glance.
+function createSessionPrHistory(
+  root: string,
+  toolCalls: { get: (id: string) => Promise<ToolCall[]> },
+  codexRolloutFile?: (sessionId: string) => string | null | Promise<string | null>,
+) {
+  const store = createSessionStore("sessionprs", isSessionPr, root);
+  // Sessions whose history has already been seeded from the call log (below). Once per process:
+  // after the first read the store is authoritative, and re-scanning would only re-add requests
+  // the user has no way to have removed.
+  const seeded = new Set<string>();
+
+  const codexPrs = createCodexPrReader(codexRolloutFile);
+
+  // Record what a finished tool did to a request, if it did anything. Most calls say nothing —
+  // `prFromToolOutput` returns null and this costs one property read.
+  async function record(sessionId: string, toolOutput: unknown): Promise<void> {
+    const pr = prFromToolOutput(toolOutput, Date.now());
+    if (!pr) return;
+    const list = await store.get(sessionId);
+    seeded.add(sessionId); // a live record supersedes any seeding this session still owed
+    if (foldSessionPr(list, pr)) void store.save(sessionId);
+  }
+
+  /** A session's requests, newest act first. Seeds itself once from the call history so a session
+   *  that was already running when this feature arrived is not blank until its next `gh pr` — the
+   *  outputs are already on disk, and the seeding reads exactly what `record` would have written.
+   *
+   *  The seed is NOT persisted, and that is the same-origin gate's rule rather than an oversight:
+   *  this is reached by a GET, and a GET that writes is unprotected by anything in
+   *  routes/same-origin-guard.ts. Costing nothing is what makes it affordable to obey — the call
+   *  history it reads is itself on disk, so a restart re-derives the same list. */
+  async function get(sessionId: string): Promise<SessionPr[]> {
+    const stored = await store.get(sessionId);
+    if (!seeded.has(sessionId)) {
+      seeded.add(sessionId);
+      for (const call of await toolCalls.get(sessionId)) {
+        // `call.at` rather than now: the history is ordered by when the session acted, and stamping
+        // a seed with the read time would sort a month-old request above this morning's.
+        const pr = prFromToolOutput(call.toolOutput, call.at);
+        if (pr) foldSessionPr(stored, pr);
+      }
+    }
+    const list = stored.map((pr) => ({ ...pr }));
+    // Folded on top rather than instead: a session is one agent, so at most one of these two ever
+    // has anything — and folding is idempotent, so a derivation that repeats costs nothing.
+    for (const pr of await codexPrs(sessionId)) foldSessionPr(list, pr);
+    return sortedSessionPrs(list);
+  }
+
+  return { record, get };
+}
+
+export function createToolStores({ publish, root = MULMOTERMINAL_HOME, codexRolloutFile }: ToolStoreDeps) {
   // GUI toolResults per session, persisted under ~/.mulmoterminal/toolresults so
   // the panel replays the rendered views even after a server reboot. (Chat +
   // message history live in the terminal and Claude's .jsonl; this is the GUI-side
@@ -216,6 +284,9 @@ export function createToolStores({ publish, root = MULMOTERMINAL_HOME }: ToolSto
   // the toolResults, so the history survives a server reboot.
   const toolCallsStore = createSessionStore("toolcalls", isToolCall, root);
   const TOOLCALLS_LIMIT = 200;
+
+  const prHistory = createSessionPrHistory(root, toolCallsStore, codexRolloutFile);
+
   // PreToolUse: a tool started. Append a "running" entry (deduped by tool_use_id).
   async function recordToolCallStart(sessionId: string, { toolUseId, toolName, toolInput }: ToolCallStartRecord) {
     const list = await toolCallsStore.get(sessionId);
@@ -246,7 +317,11 @@ export function createToolStores({ publish, root = MULMOTERMINAL_HOME }: ToolSto
     }
     publish(toolCallsChannel(sessionId), call);
     void toolCallsStore.save(sessionId);
+    // Fed the CAPPED output on purpose: only a string is ever truncated, and the field this reads
+    // is an object the agent attached, so nothing is lost — while a session that shells out a
+    // 200k-character build log gets one copy of it kept, not two.
+    void prHistory.record(sessionId, output);
   }
 
-  return { toolResultsStore, toolCallsStore, storeToolResult, recordToolCallStart, recordToolCallEnd };
+  return { toolResultsStore, toolCallsStore, storeToolResult, recordToolCallStart, recordToolCallEnd, getSessionPrs: prHistory.get };
 }

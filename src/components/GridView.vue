@@ -10,7 +10,7 @@ import type { BundledSkillName } from "../../common/bundledSkills";
 import {
   initialState,
   addCell,
-  setSession,
+  setReportedSession,
   setCwd,
   setCellAgent,
   setCellParked,
@@ -36,6 +36,7 @@ import {
   pageCount,
   zoomedUid,
   runningCount,
+  setReviewPending,
   STATE_KEY,
   LEGACY_KEY,
   type GridState,
@@ -53,6 +54,8 @@ import * as conn from "../composables/useTerminalConnections";
 import { rosterCellsKey, staleCacheKeys } from "./rosterCache";
 import type { RunCommand } from "./runCommand";
 import { becameCiFailing, EMPTY_SESSION_META, isPrPhase, mergeSessionMeta, type PrPhase, type SessionMetaView } from "./rosterPhase";
+import { parseWorkItem } from "../composables/useWorkItem";
+import type { WorkItem } from "../../common/prPhase";
 import { notifySound } from "../composables/notifySound";
 import { useGridActivity } from "../composables/useGridActivity";
 import { registerNewTerminalHandler, type NewTerminalRequest } from "../composables/useNewTerminal";
@@ -60,6 +63,7 @@ import { registerSpawnedChatHandler, type SpawnedChatRequest } from "../composab
 import { usePendingScript } from "../composables/usePendingScript";
 import { reportActiveTerminals } from "../composables/useUnloadGuard";
 import { useAppConfig } from "../composables/useAppConfig";
+import { usePhoneLayout } from "../composables/phoneLayout";
 import { fetchDirConfig, invalidateDirConfig, useDirPriorities } from "../composables/useDirConfig";
 import { nextSortMode } from "./sortModeButton";
 import { asTerminalAgent, type TerminalAgent } from "../../common/sessionAgent";
@@ -70,6 +74,7 @@ import type { LaunchPick } from "./launchers";
 import { isRecord } from "../../common/isRecord";
 import { isDrawnResult } from "../utils/drawnResult";
 import { fetchWithTimeout, SLOW_COMMAND_TIMEOUT_MS } from "../utils/fetchWithTimeout";
+import { useSharedGridState } from "../composables/useSharedGridState";
 
 // The multi-terminal grid view, shown at /terminals. Leaving the grid is just a
 // route push from the shared toolbar (Chat / Collections / a favorite), so there's
@@ -97,6 +102,7 @@ if (init.migrated) {
   localStorage.removeItem(LEGACY_KEY);
 }
 watch(state, persist, { deep: true });
+useSharedGridState(state);
 
 // Feed the tab-close guard: warn on close/reload while any cell runs a session or
 // command (counts every page, not just the mounted one).
@@ -146,6 +152,14 @@ const orderedCells = computed(() => orderCells(state.value.cells, statusForSort.
 // live); otherwise just the active page's slice. A waiting cell from any page floats to the front.
 const displayCells = computed(() => (zoomedUid(state.value) !== null ? orderedCells.value : pageSlice(orderedCells.value, state.value.page)));
 const expandedUid = computed(() => zoomedUid(state.value));
+// One screen at a time, on a window too narrow for two panes. Read here and passed down rather
+// than read in each component: the grid is where "which cell is enlarged" already lives, and on a
+// phone that ONE value is what decides which of the two screens you are looking at.
+const phone = usePhoneLayout();
+// Every cell, not the page's slice, whenever the roster is the whole screen: the list is the only
+// way to reach a session there, so a cell on another page would be unreachable rather than merely
+// off-screen. Paging is a property of the tiled grid, which a phone never shows.
+const displayCellsForLayout = computed(() => (phone.value ? orderedCells.value : displayCells.value));
 
 // The zoomed grid's cockpit roster: a text row per cell — status + dir + the user's memo +
 // AI summary + current prompt + the agent's latest reply — so many parallel agents can be
@@ -161,12 +175,13 @@ const sessionMeta = reactive(new Map<string, SessionMetaView>());
 // one goes out. Only the newest may be applied: an older one describes a moment already
 // overtaken, and its fields would put back what the newer answer replaced (#620).
 const latestMetaSeed = new Map<string, number>();
-async function seedMeta(id: string, cwd: string | null) {
+async function seedMeta(id: string, cwd: string | null, agent: Cell["agent"]) {
   const seed = (latestMetaSeed.get(id) ?? 0) + 1;
   latestMetaSeed.set(id, seed);
   try {
-    const query = cwd ? `?cwd=${encodeURIComponent(cwd)}` : "";
-    const res = await fetchWithTimeout(`/api/session/${id}${query}`);
+    const query = new URLSearchParams({ agent: agent ?? "claude" });
+    if (cwd) query.set("cwd", cwd);
+    const res = await fetchWithTimeout(`/api/session/${id}?${query}`);
     if (!res.ok || latestMetaSeed.get(id) !== seed) return;
     const d: unknown = await res.json();
     if (latestMetaSeed.get(id) !== seed) return;
@@ -175,11 +190,11 @@ async function seedMeta(id: string, cwd: string | null) {
     // best-effort — the next poll retries
   }
 }
-const refreshAllMeta = () => state.value.cells.forEach((c) => c.session && void seedMeta(c.session, c.cwd));
+const refreshAllMeta = () => state.value.cells.forEach((c) => c.session && void seedMeta(c.session, c.cwd, c.agent));
 // The PR workflow phase per directory (GET /api/pr-phase), shown in the roster beside the
 // agent status. Keyed by cwd, not session — the phase is the branch's, so cells sharing a dir
 // share one fetch. Best-effort and cached server-side, so the roster poll can re-fetch cheaply.
-const phaseByCwd = reactive(new Map<string, PrPhase>());
+const phaseByCwd = reactive(new Map<string, WorkItem>());
 const latestPhaseSeed = new Map<string, number>();
 async function seedPhase(cwd: string) {
   const seed = (latestPhaseSeed.get(cwd) ?? 0) + 1;
@@ -191,9 +206,10 @@ async function seedPhase(cwd: string) {
     if (latestPhaseSeed.get(cwd) !== seed) return;
     const phase = isRecord(d) ? d.phase : undefined;
     if (isPrPhase(phase)) {
+      const item = parseWorkItem(d);
       // Before the set, so the previous value is still the one to compare against.
-      if (becameCiFailing(phaseByCwd.get(cwd), phase)) notifySound("pr-ci-failed", cwd);
-      phaseByCwd.set(cwd, phase);
+      if (becameCiFailing(phaseByCwd.get(cwd)?.phase, item.phase)) notifySound("pr-ci-failed", cwd);
+      phaseByCwd.set(cwd, item);
     }
   } catch {
     // best-effort — the next poll retries
@@ -285,7 +301,10 @@ let rosterTimer: ReturnType<typeof setInterval> | null = null;
 // The roster is the sole consumer of this poll, and it's shown only while zoomed AND in list
 // mode (the grid can be zoomed into the thumbnail strip instead). Poll exactly when it's visible.
 const listModeOn = ref(true);
-const rosterVisible = () => expandedUid.value !== null && listModeOn.value;
+// On a phone the roster is the LIST SCREEN, so it is on show while nothing is zoomed — the exact
+// opposite of the desktop, where it is the panel beside an enlarged terminal. The poll follows the
+// roster and not the zoom, or the list would freeze at whatever it held when the page loaded.
+const rosterVisible = () => (phone.value ? expandedUid.value === null : expandedUid.value !== null && listModeOn.value);
 const startPoll = () => {
   if (!rosterVisible() || rosterTimer !== null) return;
   refreshRoster();
@@ -299,6 +318,10 @@ const syncPoll = () => (rosterVisible() ? startPoll() : stopPoll());
 // immediate: a reload that restores a zoomed grid sets expandedUid up front (no "change"
 // to react to), so start here too, or the roster would freeze at its first snapshot.
 watch(expandedUid, syncPoll, { immediate: true });
+// Crossing the width threshold swaps which state shows the roster, so it swaps which state should
+// be polling. Without this, rotating a phone into landscape leaves the list refreshing behind a
+// terminal, or the list not refreshing at all.
+watch(phone, syncPoll);
 // The header's view toggle (shown only while zoomed) flips roster / thumbnail strip; the poll
 // follows since the roster is its sole consumer.
 const toggleListMode = () => {
@@ -332,12 +355,15 @@ const rosterRow = (c: Cell): CockpitRow => {
     prompt: meta.lastPrompt,
     response: meta.lastResponse,
     fallback: fallbackLabel(c),
-    phase: (c.cwd ? phaseByCwd.get(c.cwd) : undefined) ?? NO_PR_PHASE,
+    phase: (c.cwd ? phaseByCwd.get(c.cwd)?.phase : undefined) ?? NO_PR_PHASE,
+    pr: c.cwd ? (phaseByCwd.get(c.cwd)?.pr ?? null) : null,
+    prUrl: c.cwd ? (phaseByCwd.get(c.cwd)?.prUrl ?? null) : null,
     workPhase: meta.workPhase,
     headerColor: chrome.headerColor,
     headerTextColor: chrome.headerTextColor,
     iconUrl: chrome.iconUrl,
     parked: c.parked === true,
+    reviewPending: c.reviewPending === true,
   };
 };
 const listRows = computed(() => orderedCells.value.map(rosterRow));
@@ -362,9 +388,14 @@ function onAddTerminal() {
   if (runningCount(state.value.cells) >= MAX_TERMINALS && !launchOpen.value) return; // surfaced by the disabled button
   state.value = addCell(state.value);
 }
-const onSession = (uid: number, id: string) => (state.value = setSession(state.value, uid, id));
+const onSession = (uid: number, id: string, prior: string | null) => (state.value = setReportedSession(state.value, uid, id, prior));
 const onCwd = (uid: number, cwd: string) => (state.value = setCwd(state.value, uid, cwd));
+const onLiveCwd = (uid: number, cwd: string) => (state.value = setCwd(state.value, uid, cwd));
 const onAgent = (uid: number, agent: TerminalAgent) => (state.value = setCellAgent(state.value, uid, agent));
+const onReviewPending = (uid: number, pending: boolean) => {
+  state.value = setReviewPending(state.value, uid, pending);
+  persist();
+};
 const onPark = (uid: number, parked: boolean) => (state.value = setCellParked(state.value, uid, parked));
 // Pass the on-screen order so closing the zoomed cell stays zoomed on its filmstrip
 // neighbour (previous, or next when it was the first) instead of collapsing the grid.
@@ -503,6 +534,15 @@ function runShortcut(shortcut: GridShortcut) {
     state.value = insertCellAfter(state.value, uid, shellCell(adjacentCwd(uid)));
   } else if (shortcut === "terminal-close" && uid !== null) {
     onClose(uid);
+  } else if (shortcut === "review-toggle") {
+    const target = expandedUid.value ?? focusedCellUid.value;
+    if (target !== null) {
+      const cell = state.value.cells.find((c) => c.uid === target);
+      if (cell?.session) {
+        state.value = setReviewPending(state.value, target, cell.reviewPending !== true);
+        persist();
+      }
+    }
   }
 }
 
@@ -584,25 +624,32 @@ const placeChat = ({ id, agent, canvas }: SpawnedChatRequest): boolean => {
 // Asked on ACTIVATE rather than mount: the grid is kept alive across route changes, so mount fires
 // once per page load and would miss everything spawned while the user was elsewhere in the app.
 let adoptingUnplaced = false;
+// Where the sweep is currently reading from. The two lists differ only in WHICH sessions they
+// name (see the routes); everything below — the one-at-a-time guard, the duplicate check, the cap
+// — is the same question either way, and duplicating it is how one copy would quietly lose a
+// guard the other has.
+type AdoptSource = "/api/sessions/unplaced" | "/api/sessions/live";
 // A trigger that arrived mid-sweep and has to be answered once this one lands. Deferred, not
 // DROPPED: the in-flight response was generated when the fetch was sent, so a session marked after
 // that is not in it, and simply refusing the overlapping trigger would leave that session with no
 // cell until a later route change or reload — the exact bug this whole path exists to fix (Codex,
 // this PR). One flag rather than a count: every sweep asks for the whole list, so N deferred
-// triggers and one are the same question.
-let sweepAgain = false;
-async function adoptUnplacedSessions(): Promise<void> {
+// triggers and one are the same question — PER SOURCE, which is why this is a set and not a flag:
+// the two lists name different sessions, so answering a deferred `live` trigger with an
+// `unplaced` sweep would drop exactly the sessions the deferred one was asked about.
+const sweepAgain = new Set<AdoptSource>();
+async function adoptUnplacedSessions(from: AdoptSource = "/api/sessions/unplaced"): Promise<void> {
   // One sweep at a time. The route watcher can fire again before the fetch resolves — leave the
   // grid for an overlay and come straight back — and both runs would read `cells` before either
   // inserted, so both would adopt the same session and give it two cells fighting over one socket.
   // The per-row guard below cannot catch that: it reads state neither call has written yet.
   if (adoptingUnplaced) {
-    sweepAgain = true;
+    sweepAgain.add(from);
     return;
   }
   adoptingUnplaced = true;
   try {
-    const res = await fetchWithTimeout("/api/sessions/unplaced");
+    const res = await fetchWithTimeout(from);
     if (!res.ok) return;
     const body: unknown = await res.json();
     const rows = isRecord(body) && Array.isArray(body.sessions) ? body.sessions : [];
@@ -627,10 +674,9 @@ async function adoptUnplacedSessions(): Promise<void> {
     // Whatever came in while this was in flight, asked now that the state it would have raced is
     // written. Not route-guarded again: the trigger passed that check when it ARRIVED, and the
     // grid stays mounted under an overlay anyway — the cell is simply there when the user returns.
-    if (sweepAgain) {
-      sweepAgain = false;
-      void adoptUnplacedSessions();
-    }
+    const deferred = [...sweepAgain];
+    sweepAgain.clear();
+    for (const source of deferred) void adoptUnplacedSessions(source);
   }
 }
 // Driven by the ACTUAL route, not by activation. Since #1193 the grid stays mounted underneath a
@@ -642,6 +688,28 @@ watch(
   onTerminalsRoute,
   (onGrid) => {
     if (onGrid) void adoptUnplacedSessions();
+  },
+  { immediate: true },
+);
+// The phone additionally takes EVERY live session, not just the ones no grid has claimed.
+//
+// The grid arrangement is `localStorage`, which is per origin: a phone reaching this same server
+// over the tunnel is a different origin from the desktop's `localhost`, so it starts with an empty
+// grid and the unplaced sweep correctly finds nothing — every session is already placed, in a grid
+// the phone cannot see. Without this the second screen can only ever show sessions it started
+// itself, which is not what a second screen is for.
+//
+// Only on the phone, and only on the way IN. Making the desktop do this would undo closing a cell
+// (the next reload would take it straight back), and sweeping continuously would do the same on the
+// phone; arriving at the grid is the moment "show me what is running" is the question being asked.
+//
+// This hands the session's socket to the phone — the server allows one client per session and the
+// newest wins (pty-connection.ts) — so the desktop's cells go to "[detached]" as this lands. That
+// is the intended trade and the way back is a reload, which is why the detach banner says so.
+watch(
+  [onTerminalsRoute, phone],
+  ([onGrid, isPhone]) => {
+    if (onGrid && isPhone) void adoptUnplacedSessions("/api/sessions/live");
   },
   { immediate: true },
 );
@@ -744,19 +812,29 @@ onBeforeUnmount(detachSpawnedChat);
 
 <template>
   <div class="flex flex-col h-screen w-screen overflow-hidden">
+    <!-- Gone on the phone's DETAIL screen: the terminal is what that screen is for, and the header
+         was spending 44 of 844 pixels on the app's own name plus four controls that belong to the
+         list. Nothing is stranded — the way back is the cell's own ⤡ (close_fullscreen, which
+         emits the same toggle-expand a roster row does), and it is already on screen, in the cell
+         header directly below where this bar was.
+
+         Still drawn on the LIST screen, where it is the only place New terminal, the bell and
+         Settings exist at all. -->
     <AppToolbar
+      v-if="!(phone && expandedUid !== null)"
       :add-terminal-active="launchOpen"
       :sort-mode="state.sortMode"
       :status-counts="statusCounts"
-      :show-view-toggle="expandedUid !== null"
+      :show-view-toggle="expandedUid !== null && !phone"
       :list-mode="listModeOn"
+      :phone="phone"
       @add-terminal="onAddTerminal"
       @toggle-sort="toggleSortMode"
       @toggle-view="toggleListMode"
       @settings="showSettings = true"
     />
     <nav
-      v-if="pages > 1 && expandedUid === null"
+      v-if="pages > 1 && expandedUid === null && !phone"
       class="flex-none flex items-center gap-1 h-[30px] px-4 bg-panel border-b border-border"
       aria-label="Grid tabs"
     >
@@ -773,7 +851,7 @@ onBeforeUnmount(detachSpawnedChat);
     <TerminalGrid
       ref="gridRef"
       class="flex-1 min-h-0 min-w-0"
-      :cells="displayCells"
+      :cells="displayCellsForLayout"
       :expanded-uid="expandedUid"
       :list-rows="listRows"
       :cancel-uid="cancelUid"
@@ -785,11 +863,14 @@ onBeforeUnmount(detachSpawnedChat);
       :reorderable="reorderable"
       :open-session-ids="openSessionIds"
       :open-cwds="openCwds"
-      :list-mode="listModeOn"
+      :list-mode="phone || listModeOn"
+      :phone="phone"
       @session="onSession"
       @agent="onAgent"
+      @review-pending="onReviewPending"
       @park="onPark"
       @cwd="onCwd"
+      @live-cwd="onLiveCwd"
       @record-cwd="recordPreset"
       @remove-preset="removePreset"
       @close="onClose"

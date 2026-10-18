@@ -23,6 +23,10 @@ vi.mock("node:fs", () => {
   return { promises, default: { promises } };
 });
 
+// plugin-routes now reads the saved directories (config-routes) for a requested cwd; loading the
+// real config would read the mocked node:fs above. No request here names a cwd, so it is unused.
+vi.mock("../../../server/config/config-routes.js", () => ({ getCwdPresets: () => [], getRepoDirs: () => ({}) }));
+
 const { mountPluginRoutes } = await import("../../../server/routes/plugin-routes.js");
 const { runCompletionHook } = await import("../../../server/session/completion-hooks.js");
 const { isFailedWorker, unplacedSessionRows } = await import("../../../server/session/registry.js");

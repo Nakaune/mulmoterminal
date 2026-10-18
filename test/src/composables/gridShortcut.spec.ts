@@ -44,6 +44,12 @@ describe("gridShortcutFor", () => {
     expect(gridShortcutFor(map, key({ key: "F1" }), true)).toBe("terminal-new");
   });
 
+  it("lets review-toggle use the focused cell with or without zoom", () => {
+    const map: Keymap = { "review-toggle": "F4" };
+    expect(gridShortcutFor(map, key({ key: "F4" }), false)).toBe("review-toggle");
+    expect(gridShortcutFor(map, key({ key: "F4" }), true)).toBe("review-toggle");
+  });
+
   it("leaves Shift+PageUp alone when only the bare key is bound (xterm's scrollback)", () => {
     expect(gridShortcutFor(KEYMAP, key({ key: "PageUp", shiftKey: true }), true)).toBeNull();
     expect(gridShortcutFor(KEYMAP, key({ key: "PageDown", shiftKey: true }), true)).toBeNull();

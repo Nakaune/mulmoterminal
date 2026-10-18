@@ -171,6 +171,43 @@ describe("publishActivity's reply refresh", () => {
 });
 
 describe("the reap timer", () => {
+  it("keeps Codex whose terminal and rollout activity are both unknown", () => {
+    vi.useFakeTimers();
+    ptys.set(ID, fakeEntry({ agent: "codex" }));
+    createSessionLifecycle(makeDeps()).armReapForDetached(ID);
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(60 * 60_000);
+    expect(ptys.has(ID)).toBe(true);
+  });
+
+  it("does not reap Codex if its state becomes unknown during an idle grace", () => {
+    vi.useFakeTimers();
+    const entry = fakeEntry({ agent: "codex", codexTerminalState: "idle" });
+    ptys.set(ID, entry);
+    createSessionLifecycle(makeDeps()).armReapForDetached(ID);
+    delete (entry as { codexTerminalState?: string }).codexTerminalState;
+    vi.advanceTimersByTime(60_000);
+    expect(ptys.has(ID)).toBe(true);
+  });
+
+  it("does not apply an old timer to a replacement pty", () => {
+    vi.useFakeTimers();
+    ptys.set(ID, fakeEntry());
+    createSessionLifecycle(makeDeps()).armReapForDetached(ID);
+    const replacement = fakeEntry();
+    ptys.set(ID, replacement);
+    vi.advanceTimersByTime(60_000);
+    expect(ptys.get(ID)).toBe(replacement);
+  });
+
+  it("rechecks working activity when an idle timer fires", () => {
+    vi.useFakeTimers();
+    ptys.set(ID, fakeEntry());
+    createSessionLifecycle(makeDeps()).armReapForDetached(ID);
+    activity.set(ID, { working: true, waiting: false, event: "UserPromptSubmit", at: 2 });
+    vi.advanceTimersByTime(60_000);
+    expect(ptys.has(ID)).toBe(true);
+  });
   // A session the user is looking at must never be reaped out from under them.
   // Two independent guards protect an attached session: arming skips it, and the timer
   // re-checks when it fires. Asserting only "the session survived" cannot tell them apart —

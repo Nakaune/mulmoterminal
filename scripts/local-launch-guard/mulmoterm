@@ -1,0 +1,474 @@
+#!/usr/bin/env bash
+# MulmoTerminal の起動 / 停止 / 状態確認。
+#
+#   mulmoterm          起動 (既に動いていれば URL を表示するだけ)
+#   mulmoterm status   状態と到達 URL
+#   mulmoterm stop     停止
+#   mulmoterm log      サーバログを追う
+#   mulmoterm restart  停止して起動
+#   mulmoterm sessions worktree を跨いだセッション一覧 (= mt-sessions)
+#   mulmoterm keys     セル内 tmux の追加キーバインドを入れ直す
+#   mulmoterm proxy    origin 書き換えプロキシだけ起動 (通常は start が面倒を見る)
+#   mulmoterm proxy-restart  プロキシだけ入れ直す (本体とセッションは触らない)
+#
+# 端末を閉じてもサーバが落ちないよう setsid で切り離して起動する。
+# ログは ~/.mulmoterminal/server.log。
+#
+# permission mode は本体既定 (auto) のまま。default にしたい場合は
+# CLAUDE_PERMISSION_MODE=default mulmoterm で起動する。
+
+set -uo pipefail
+
+PORT="${MULMOTERM_PORT:-34567}"
+LOG="$HOME/.mulmoterminal/server.log"
+TMUX_CONF="$HOME/.mulmoterminal/tmux.conf"
+TMUX_USER_CONF="$HOME/.mulmoterminal/tmux.user.conf"
+OPS_DIR="$HOME/.local/libexec/mulmoterminal-guard"
+PREPARED_RELEASE=""
+if [ -z "${MULMOTERM_PACKAGE+x}" ] && [ -f "$HOME/.local/share/mulmoterminal-local/current.json" ]; then
+  MULMOTERM_PACKAGE="$(python3 "$OPS_DIR/release.py" selected-archive)" || exit 1
+fi
+MULMOTERM_PACKAGE="${MULMOTERM_PACKAGE:-$HOME/.local/share/mulmoterminal-local/mulmoterminal-4.6.0-local-protected-20261018-codex-roster.tgz}"
+# 配布版には無く、ローカル改造版にだけ在る機能の目印。配信中の bundle をこの
+# トークンで検査する。tgz を差し替えたときに機能が黙って落ちるのを防ぐための唯一の
+# 実物検査で、OSS 側の verify-local-hotfix-build.mjs (build 時) では届かない範囲。
+MULMOTERM_LOCAL_FEATURES="${MULMOTERM_LOCAL_FEATURES:-system-resource-gauge system-resource-usage-color rate-limit-usage-color cell-review-badge cell-review-toggle review-toggle session-prs-chip api/grid-state}"
+
+# Codex は WSL 内の NVM に入っている。NVM は対話シェルでだけ読み込まれるため、
+# 切り離して起動するこのランチャーではサブシェル内で明示的に読み込んで解決する。
+resolve_codex_bin() {
+  command -v codex 2>/dev/null && return 0
+  [ -s "$HOME/.nvm/nvm.sh" ] || return 1
+  export NVM_DIR="$HOME/.nvm"
+  # shellcheck disable=SC1091
+  . "$NVM_DIR/nvm.sh" >/dev/null 2>&1
+  command -v codex 2>/dev/null
+}
+CODEX_BIN="${CODEX_BIN:-$(resolve_codex_bin || true)}"
+export CODEX_BIN
+
+# NVM の bin を PATH に前置して、対話シェルと同じ解決順にそろえる。
+# 非対話シェル (Windows 側の Codex から `wsl.exe -- ...` で起動した場合など) では NVM が
+# 読み込まれず、そこから起動したサーバとそれが生む全セルで codex / codegraph / firebase /
+# node が PATH から消える。2026-08-27 に実際に起き、MCP サーバ 2 本と advisor --engine codex が
+# 無言で ENOENT になった。ここで直さないと壊れ方がセル側に出るので原因まで遠い。
+#
+# codex の場所からは引かない。codex は standalone 版が ~/.local/bin へ入ることがあり
+# (2026-08-28 に実際に入れ替わった)、そのとき「codex の隣」は NVM ではなくなって前置が
+# 黙って no-op になる。~/.nvm を直接見る。
+nvm_bin_dir() {
+  local root want dir
+  root="$HOME/.nvm/versions/node"
+  [ -d "$root" ] || return 1
+  # default エイリアスは "22" のようなメジャー指定のこともあるので、前方一致で最新を採る。
+  want="$(cat "$HOME/.nvm/alias/default" 2>/dev/null || true)"
+  want="${want#v}"
+  case "$want" in
+    [0-9]*) dir="$(ls -1 "$root" 2>/dev/null | grep -E "^v${want}([.]|$)" | sort -V | tail -1)" ;;
+    *) dir="" ;;
+  esac
+  [ -n "$dir" ] || dir="$(ls -1 "$root" 2>/dev/null | sort -V | tail -1)"
+  [ -n "$dir" ] && [ -d "$root/$dir/bin" ] && echo "$root/$dir/bin"
+}
+NVM_BIN="$(nvm_bin_dir || true)"
+if [ -n "$NVM_BIN" ]; then
+  case ":$PATH:" in
+    *":$NVM_BIN:"*) ;;
+    *) PATH="$NVM_BIN:$PATH"; export PATH ;;
+  esac
+fi
+
+TS_EXE="/mnt/c/Program Files/Tailscale/tailscale.exe"
+
+# iPhone など tailnet の端末から開くための前段プロキシ。本体の isAllowedOrigin は
+# loopback の Origin しか通さないので、tailscale serve はこちらへ向ける。
+PROXY_PORT="${MULMOTERM_PROXY_PORT:-34568}"
+PROXY_SCRIPT="$HOME/.local/bin/mt-origin-proxy.mjs"
+PROXY_LOG="$HOME/.mulmoterminal/origin-proxy.log"
+
+# 検証開始から起動完了まで直列化し、選択中の release が途中で変わることを防ぐ。
+START_LOCK="$HOME/.mulmoterminal/start.lock"
+
+# 開発ヒートマップの窓口。toolbarLinks はこの URL を開き、開いたときに集計が走る
+# (README「開発ヒートマップ」)。start / stop / status で proxy と同じ扱い。
+HEATMAP_PORT="${MT_HEATMAP_PORT:-34569}"
+HEATMAP_SCRIPT="$HOME/.local/bin/mt-heatmap-server.mjs"
+HEATMAP_LOG="$HOME/.mulmoterminal/heatmap-server.log"
+
+listening() { ss -ltn 2>/dev/null | grep -q ":${PORT} "; }
+proxy_listening() { ss -ltn 2>/dev/null | grep -q ":${PROXY_PORT} "; }
+
+proxy_pids() {
+  pgrep -f "mt-origin-proxy.mjs" 2>/dev/null
+}
+
+start_proxy() {
+  [ -f "$PROXY_SCRIPT" ] || return 0
+  proxy_listening && return 0
+  mkdir -p "$(dirname "$PROXY_LOG")"
+  setsid nohup node "$PROXY_SCRIPT" >>"$PROXY_LOG" 2>&1 < /dev/null 9>&- &
+  disown 2>/dev/null
+  for _ in $(seq 1 10); do
+    proxy_listening && break
+    sleep 1
+  done
+  if ! proxy_listening; then
+    echo "mulmoterm: origin proxy を起動できませんでした。ログ末尾:" >&2
+    tail -10 "$PROXY_LOG" >&2
+    return 1
+  fi
+}
+
+stop_proxy() {
+  local pids
+  pids=$(proxy_pids)
+  # shellcheck disable=SC2086
+  [ -n "$pids" ] && kill $pids 2>/dev/null
+  for _ in $(seq 1 10); do
+    proxy_listening || break
+    sleep 1
+  done
+}
+
+heatmap_listening() { ss -ltn 2>/dev/null | grep -q ":${HEATMAP_PORT} "; }
+heatmap_pids() { pgrep -f "mt-heatmap-server.mjs" 2>/dev/null; }
+
+start_heatmap() {
+  [ -f "$HEATMAP_SCRIPT" ] || return 0
+  heatmap_listening && return 0
+  mkdir -p "$(dirname "$HEATMAP_LOG")"
+  setsid nohup node "$HEATMAP_SCRIPT" >>"$HEATMAP_LOG" 2>&1 < /dev/null 9>&- &
+  disown 2>/dev/null
+  for _ in $(seq 1 10); do
+    heatmap_listening && break
+    sleep 1
+  done
+  if ! heatmap_listening; then
+    echo "mulmoterm: heatmap server を起動できませんでした。ログ末尾:" >&2
+    tail -10 "$HEATMAP_LOG" >&2
+    return 1
+  fi
+}
+
+stop_heatmap() {
+  local pids
+  pids=$(heatmap_pids)
+  # shellcheck disable=SC2086
+  [ -n "$pids" ] && kill $pids 2>/dev/null
+  for _ in $(seq 1 10); do
+    heatmap_listening || break
+    sleep 1
+  done
+}
+
+server_pids() {
+  pgrep -f "mulmoterminal/server/index.ts" 2>/dev/null
+}
+
+urls() {
+  echo "  ローカル : http://localhost:${PORT}"
+  if [ -x "$TS_EXE" ]; then
+    local name
+    name=$("$TS_EXE" status --json 2>/dev/null \
+      | python3 -c 'import sys,json;d=json.load(sys.stdin);print((d.get("Self") or {}).get("DNSName","").rstrip("."))' 2>/dev/null)
+    if [ -n "$name" ]; then
+      if "$TS_EXE" serve status 2>/dev/null | grep -q "proxy http://127.0.0.1:${PROXY_PORT}"; then
+        if proxy_listening; then
+          echo "  Tailscale: https://${name}/   (HTTPS / iPhone から操作可)"
+        else
+          echo "  Tailscale: https://${name}/   (プロキシ停止中 — 'mulmoterm proxy' で起動)"
+        fi
+      elif "$TS_EXE" serve status 2>/dev/null | grep -q "proxy http://127.0.0.1:${PORT}"; then
+        echo "  Tailscale: https://${name}/   (本体に直結 — ターミナルは繋がりません。'mulmoterm serve' で張り直してください)"
+      else
+        echo "  Tailscale: serve 未設定 — 'mulmoterm serve' で HTTPS を張れます"
+      fi
+    fi
+  fi
+}
+
+# セル内 tmux (-L mulmoterminal) への追加キーバインドを効かせる。
+#
+# 本体は起動のたびに ~/.mulmoterminal/tmux.conf を既定値で丸ごと上書きするので
+# (server/infra/tmux.ts の ensureConf)、そこに直接書いた設定は次の起動で消える。
+# だから追加分は tmux.user.conf に置き、上書きされた tmux.conf へ source-file 行を
+# 足し直す。行が無いまま作られてしまった tmux server にも効くよう、既に動いている
+# server には直接読ませる。どちらも冪等。
+apply_keys() {
+  [ -f "$TMUX_USER_CONF" ] || return 0
+
+  # これから作られる tmux server 用 (tmux.conf は -f で読まれる)。
+  # -q を付けるので、user conf を消しても tmux は起動できる。
+  if [ -f "$TMUX_CONF" ] && ! grep -qF "$TMUX_USER_CONF" "$TMUX_CONF"; then
+    printf 'source-file -q %s\n' "$TMUX_USER_CONF" >> "$TMUX_CONF"
+  fi
+
+  # 既に動いている server 用 (稼働中のセルにも即座に効く)。
+  if tmux -L mulmoterminal list-sessions >/dev/null 2>&1; then
+    if ! tmux -L mulmoterminal source-file "$TMUX_USER_CONF" 2>/dev/null; then
+      echo "mulmoterm: tmux.user.conf を読み込めませんでした ($TMUX_USER_CONF)" >&2
+      return 1
+    fi
+  fi
+}
+
+# server の cwd が実際に配信している package dir。移行前の npx も検査できる。
+cache_dir() {
+  local pid dir
+  pid="$(server_pids | head -1)"
+  [ -n "$pid" ] || return 1
+  dir="$(readlink -f "/proc/$pid/cwd" 2>/dev/null)" || return 1
+  case "$dir" in
+    *"/_npx/"*|"$HOME/.local/share/mulmoterminal-local/releases/"*/runtime/node_modules/mulmoterminal)
+      printf '%s\n' "$dir"; return 0 ;;
+  esac
+  return 1
+}
+
+# 検証基準は配布物の外に保存する。環境変数では無効化できない。
+verify_package() {
+  python3 "$HOME/.local/libexec/mulmoterminal-guard/verify.py" archive "$MULMOTERM_PACKAGE"
+}
+
+prepare_runtime() {
+  [ -n "$PREPARED_RELEASE" ] && return 0
+  PREPARED_RELEASE="$(python3 "$OPS_DIR/release.py" resolve --archive "$MULMOTERM_PACKAGE")" || return 1
+  [ -x "$PREPARED_RELEASE/runtime/bin/node" ] || return 1
+}
+
+verify_running_package() {
+  local deployed
+  deployed="$(cache_dir)" || { echo "mulmoterm: 稼働中の配布先を検証できません" >&2; return 1; }
+  python3 "$HOME/.local/libexec/mulmoterminal-guard/verify.py" runtime "$deployed"
+}
+
+# ローカル改造が配信物に入っているかを、配信されている実物で確かめる。
+#
+# なぜ実物か: npx は同じ package spec を同じ cache dir へ**上書き**展開するので、
+# 別の tgz を配備すると古い bundle が残ったまま index.html だけ新しくなる。
+# tgz の中身が正しくても配信物が正しいとは限らない。2026-08-12 にこの形で
+# system resource ゲージが落ち、ブラウザが旧 bundle をキャッシュしていたため
+# 6 日間気づけなかった。
+verify_deploy() {
+  verify_running_package || return 1
+  local html bundle tmp missing="" token
+  html="$(curl --connect-timeout 3 --max-time 15 -fsS "http://127.0.0.1:${PORT}/" 2>/dev/null)" || {
+    echo "mulmoterm: 配信物を取得できませんでした (port ${PORT})" >&2; return 1; }
+  bundle="$(printf '%s' "$html" | grep -o 'assets/index-[A-Za-z0-9_-]*\.js' | head -1)"
+  [ -n "$bundle" ] || { echo "mulmoterm: index.html から bundle を特定できませんでした" >&2; return 1; }
+  # bundle は 4MB 近くある。コマンド置換で変数へ入れると NUL で切れて、後ろに
+  # 在るトークンを「無い」と誤判定する (実際に踏んだ)。file に落として grep する。
+  tmp="$(mktemp)" || return 1
+  if ! curl --connect-timeout 3 --max-time 20 -fsS "http://127.0.0.1:${PORT}/${bundle}" -o "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    echo "mulmoterm: bundle を取得できませんでした ($bundle)" >&2; return 1
+  fi
+  for token in $MULMOTERM_LOCAL_FEATURES; do
+    grep -q -- "$token" "$tmp" || missing="$missing $token"
+  done
+  rm -f "$tmp"
+  [ -z "$missing" ] && return 0
+  echo "mulmoterm: 配信中の bundle にローカル改造が入っていません:$missing" >&2
+  echo "  配信 bundle : $bundle" >&2
+  echo "  package     : $MULMOTERM_PACKAGE" >&2
+  echo "  npx cache が前の tgz と混ざっている可能性があります。直すには:" >&2
+  echo "    mulmoterm stop" >&2
+  echo "    rm -rf <mulmoterm doctor が出す npx cache>" >&2
+  echo "    mulmoterm start" >&2
+  return 1
+}
+
+with_start_lock() {
+  mkdir -p "$(dirname "$START_LOCK")"
+  exec 9>"$START_LOCK"
+  # 先行の start を待ってから listening を見直す。待ちきれなければ諦める
+  # (走り出すと壊すので、諦めるほうが安全)。
+  if ! flock -w 600 9; then
+    echo "mulmoterm: 別の起動処理が長すぎます。'mulmoterm log' で確認してください" >&2
+    return 1
+  fi
+
+  "$@"
+}
+
+restart() {
+  # 依存関係の欠落・Node ABI・native PTY を、稼働中の server を止める前に検査する。
+  verify_package && prepare_runtime && stop && start
+}
+
+start() {
+  verify_package || return 1
+
+  if listening; then
+    echo "mulmoterm: 既に稼働中 (port ${PORT})"
+    apply_keys
+    start_proxy
+    start_heatmap || true
+    urls
+    verify_deploy
+    return $?
+  fi
+  mkdir -p "$(dirname "$LOG")"
+  prepare_runtime || return 1
+  echo "mulmoterm: 起動中..."
+  # --cwd を明示する。省くと本体は CLAUDE_CWD (bin/cli-args.js の優先順) を採り、セルの中から
+  # start したときはセルが export している CLAUDE_CWD を引き継いでしまう。2026-08-27 に
+  # /mnt/c のセルから start して既定セルと probe が 9p 上へ移った。別の場所にしたいときは
+  # MULMOTERM_CWD で指定する。
+  # 既定は project に固定する: $PWD を既定にすると、別のディレクトリから restart しただけで
+  # 既定セルと rate-limit probe の cwd が変わり、未 trust のディレクトリでは probe が trust ダイアログで
+  # 止まって quota 表示が消える (2026-10-01 に /home/example から restart して発生)。
+  local runtime_node="$PREPARED_RELEASE/runtime/bin/node"
+  local runtime_entry="$PREPARED_RELEASE/runtime/node_modules/mulmoterminal/bin/mulmoterminal.js"
+  setsid nohup env -u NO_COLOR -u TMUX PATH="$(dirname "$runtime_node"):$PATH" "$runtime_node" "$runtime_entry" --no-open --port "$PORT" --cwd "${MULMOTERM_CWD:-$HOME/project}" \
+    >>"$LOG" 2>&1 < /dev/null 9>&- &
+  local startup_pid=$!
+  disown 2>/dev/null
+
+  # 起動時に install は行わない。失敗時は検証済み release を再選択できる。
+  for _ in $(seq 1 60); do
+    listening && break
+    kill -0 "$startup_pid" 2>/dev/null || break
+    sleep 1
+  done
+
+  if listening; then
+    echo "mulmoterm: 起動しました"
+    apply_keys
+    start_proxy
+    start_heatmap || true
+    urls
+    if ! verify_deploy; then
+      stop
+      return 1
+    fi
+  else
+    echo "mulmoterm: 起動できませんでした。ログ末尾:" >&2
+    tail -20 "$LOG" >&2
+    return 1
+  fi
+}
+
+stop() {
+  local pids
+  stop_proxy
+  stop_heatmap
+  pids=$(server_pids)
+  if [ -z "$pids" ] && ! listening; then
+    echo "mulmoterm: 動いていません"
+    return 0
+  fi
+  # shellcheck disable=SC2086
+  [ -n "$pids" ] && kill $pids 2>/dev/null
+  for _ in $(seq 1 10); do
+    listening || break
+    sleep 1
+  done
+  if listening; then
+    echo "mulmoterm: 停止できませんでした (port ${PORT} が残っています)" >&2
+    return 1
+  fi
+  echo "mulmoterm: 停止しました"
+}
+
+status() {
+  if listening; then
+    echo "mulmoterm: 稼働中 (port ${PORT}, pid $(server_pids | tr '\n' ' '))"
+    if proxy_listening; then
+      echo "  origin proxy: 稼働中 (port ${PROXY_PORT}, pid $(proxy_pids | tr '\n' ' '))"
+    else
+      echo "  origin proxy: 停止中"
+    fi
+    if heatmap_listening; then
+      echo "  heatmap server: 稼働中 (port ${HEATMAP_PORT}, pid $(heatmap_pids | tr '\n' ' '))"
+    else
+      echo "  heatmap server: 停止中"
+    fi
+    urls
+  else
+    echo "mulmoterm: 停止中"
+  fi
+}
+
+# tailscale serve は本体ではなく origin プロキシへ向ける。本体に直結すると
+# ページは出るがターミナルの WebSocket が全部 origin 判定で落ちる。
+serve() {
+  [ -x "$TS_EXE" ] || { echo "tailscale.exe が見つかりません" >&2; return 1; }
+  start_proxy || return 1
+  "$TS_EXE" serve --bg --https=443 "http://127.0.0.1:${PROXY_PORT}"
+}
+
+doctor() {
+  local check_status=0
+  verify_package || check_status=1
+  echo "package     : $MULMOTERM_PACKAGE"
+  if [ -f "$MULMOTERM_PACKAGE" ]; then
+    ls -l --time-style=long-iso "$MULMOTERM_PACKAGE" | awk '{printf "              %s %s  %s bytes\n", $6, $7, $5}'
+  else
+    echo "              (見つかりません)"
+  fi
+  local d p b
+  d="$(cache_dir)" && echo "runtime     : $d" || echo "runtime     : (停止中のため特定できません)"
+  if listening; then
+    b="$(curl --connect-timeout 3 --max-time 15 -fsS "http://127.0.0.1:${PORT}/" 2>/dev/null | grep -o 'assets/index-[A-Za-z0-9_-]*\.js' | head -1)"
+    echo "配信 bundle : ${b:-(取得できません)}"
+    if verify_deploy; then
+      echo "ローカル改造: 配信物に全て入っています"
+      echo "              ($MULMOTERM_LOCAL_FEATURES)"
+    else
+      check_status=1
+    fi
+  else
+    echo "サーバ      : 停止中"
+  fi
+  p="$(server_pids | head -1)"
+  if [ -n "$p" ]; then
+    if tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -q '^TMUX='; then
+      echo "TMUX 継承   : あり (tmux 入れ子エラーの前提条件)"
+    else
+      echo "TMUX 継承   : なし"
+    fi
+    # 起動時の環境はサーバが生む全セルへそのまま流れる。壊れていても症状はセル側にしか
+    # 出ないので、ここで実物 (/proc の environ) を検査する。説明ではなく検出器を残す。
+    local srv_env srv_cwd
+    srv_env="$(tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null)"
+    if printf '%s\n' "$srv_env" | grep -q "^PATH=.*${HOME}/\.nvm/"; then
+      echo "NVM PATH    : あり"
+    else
+      echo "NVM PATH    : 無し ⚠ セル内で codex / codegraph / firebase / node が見つかりません"
+      echo "              (非対話シェルから起動した跡。stop → start で直ります)"
+    fi
+    srv_cwd="$(printf '%s\n' "$srv_env" | sed -n 's/^CLAUDE_CWD=//p' | head -1)"
+    echo "既定 cwd    : ${srv_cwd:-(未設定)}"
+    case "$srv_cwd" in
+      /mnt/*) echo "              ⚠ /mnt 配下です。start したディレクトリがそのまま既定セルの cwd になります" ;;
+    esac
+  fi
+  echo "npx cache 数: $(find "$HOME/.npm/_npx" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l) 個 (容量は du -sh ~/.npm/_npx で。数分かかる)"
+  return "$check_status"
+}
+
+case "${1:-start}" in
+  start)   with_start_lock start ;;
+  stop)    stop ;;
+  restart) with_start_lock restart ;;
+  check-package) verify_package ;;
+  prepare) with_start_lock prepare_runtime ;;
+  release-status) python3 "$OPS_DIR/release.py" status ;;
+  activate) shift; python3 "$OPS_DIR/release.py" select "$@" ;;
+  backup) shift; exec bash "$OPS_DIR/backup.sh" "$@" ;;
+  status)  status ;;
+  # 配備が意図どおりか (ローカル改造が配信物に入っているか) を実物で確かめる。
+  doctor)  doctor ;;
+  serve)   serve ;;
+  log)     tail -f "$LOG" ;;
+  # resume ピッカーはセルの作業ディレクトリ 1 つにしかスコープされないので、
+  # worktree を跨いだ「どこに何のセッションがあるか」は mt-sessions で見る。
+  sessions|s) shift; exec mt-sessions "$@" ;;
+  # tmux.conf を本体に上書きされた後や、user conf を編集した後に入れ直す。
+  keys)    apply_keys && echo "mulmoterm: tmux キーバインドを適用しました" ;;
+  proxy)   start_proxy && echo "mulmoterm: origin proxy 稼働中 (port ${PROXY_PORT})" ;;
+  # プロキシやキーバーを編集した後に使う。本体を止めないのでセルの接続は切れない。
+  proxy-restart) stop_proxy; start_proxy && echo "mulmoterm: origin proxy を入れ直しました (port ${PROXY_PORT})" ;;
+  *)       echo "usage: mulmoterm [start|stop|restart|prepare|release-status|activate ID|backup REPO [DEST]|status|doctor|check-package|serve|proxy|proxy-restart|log|sessions|keys]" >&2; exit 2 ;;
+esac

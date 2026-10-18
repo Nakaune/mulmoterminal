@@ -124,8 +124,18 @@ describe("startAndWire", () => {
   it("wires the close handler to the started entry", () => {
     const { socket, handleClientClose, deps, early } = harness();
     startAndWire(deps, asWebSocket(socket), { id: "s1", tag: "launch", early, startFailureMessage: () => "nope" }, () => entry);
-    socket.emit("close");
-    expect(handleClientClose).toHaveBeenCalledWith(entry, expect.anything(), "s1");
+    socket.emit("close", 1000);
+    expect(handleClientClose).toHaveBeenCalledWith(entry, expect.anything(), "s1", 1000);
+  });
+
+  // The socket knows whether it was closed or broke; nothing downstream can work it out
+  // afterwards. This wiring used to drop the code, which is what made a network drop and a
+  // closed cell reach the reap policy as the same event.
+  it("passes the close code on, so a broken socket is not read as a deliberate close", () => {
+    const { socket, handleClientClose, deps, early } = harness();
+    startAndWire(deps, asWebSocket(socket), { id: "s1", tag: "launch", early, startFailureMessage: () => "nope" }, () => entry);
+    socket.emit("close", 1006);
+    expect(handleClientClose).toHaveBeenCalledWith(entry, expect.anything(), "s1", 1006);
   });
 
   // A spawn that throws is a missing CLI or a directory that vanished. There is no pty to replay

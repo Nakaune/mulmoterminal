@@ -54,6 +54,37 @@ describe("slot attachment", () => {
     expect(el.childElementCount).toBe(0);
   });
 
+  // The shared grid can hand this uid to another session (another browser renumbered or reused
+  // it). Reusing the slot would replay the OLD id and write it back over the new cell.
+  it("drops a slot that still holds a different session than the cell now asks for", () => {
+    const first = document.createElement("div");
+    conn.attach(KEY, { ...target, sessionId: "11111111-1111-4111-8111-111111111111" }, {}, first);
+    const oldWs = FakeWebSocket.instances.at(-1);
+    conn.detach(KEY, first);
+
+    const seen: string[] = [];
+    const next = document.createElement("div");
+    conn.attach(KEY, { ...target, sessionId: "22222222-2222-4222-8222-222222222222" }, { onSession: (id) => seen.push(id) }, next);
+
+    expect(seen).not.toContain("11111111-1111-4111-8111-111111111111");
+    const newWs = FakeWebSocket.instances.at(-1);
+    expect(newWs).not.toBe(oldWs);
+    expect(newWs?.url).toContain("session=22222222-2222-4222-8222-222222222222");
+  });
+
+  it("keeps a slot whose session id arrived while detached (the cell still says null)", () => {
+    const first = document.createElement("div");
+    conn.attach(KEY, { ...target, sessionId: "33333333-3333-4333-8333-333333333333" }, {}, first);
+    const ws = FakeWebSocket.instances.at(-1);
+    conn.detach(KEY, first);
+
+    const seen: string[] = [];
+    conn.attach(KEY, target, { onSession: (id) => seen.push(id) }, document.createElement("div"));
+
+    expect(seen).toEqual(["33333333-3333-4333-8333-333333333333"]);
+    expect(FakeWebSocket.instances.at(-1)).toBe(ws);
+  });
+
   // The safety net under the rule above: whatever the bookkeeping says, a terminal whose host is
   // still in the document is attached, and must not be left in a state where nothing ever fits or
   // repaints it again.

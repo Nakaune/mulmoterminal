@@ -166,3 +166,31 @@ describe("the open pane's button, seen", () => {
     expect(button({ rightPane: "files" }, TOOLS).classes()).toContain("bg-transparent");
   });
 });
+
+// The phone keeps ONE row of cell chrome, and the only thing on it this component owns is the way
+// back. The panes it drops each want a second column the phone does not have — they take the whole
+// screen there, covering the terminal the session was opened to read — and park and close act on a
+// GRID the phone is not arranging.
+describe("CellChromeButtons (phone)", () => {
+  const phoneButtons = (over: Record<string, unknown> = {}) =>
+    mount(CellChromeButtons, { props: { expanded: true, phone: true, parked: false, canvasAvailable: true, ...over } });
+  const labelsOf = (w: ReturnType<typeof mount>) => w.findAll("button").map((b) => b.attributes("aria-label") ?? "");
+
+  it("keeps only the way back", () => {
+    expect(labelsOf(phoneButtons())).toEqual(["Restore terminal"]);
+  });
+
+  // Still the same button, so the roster row and this agree on what "back" means.
+  it("still asks to un-zoom", async () => {
+    const w = phoneButtons();
+    await w.get('[aria-label="Restore terminal"]').trigger("click");
+    expect(w.emitted("toggle-expand")).toHaveLength(1);
+  });
+
+  // The desktop is where the grid gets arranged, and it loses nothing.
+  it("leaves the desktop row whole", () => {
+    const labels = labelsOf(mount(CellChromeButtons, { props: { expanded: true, parked: false, canvasAvailable: true } }));
+    expect(labels).toEqual(expect.arrayContaining(["Restore terminal", "Show files", "Close terminal"]));
+    expect(labels.length).toBeGreaterThan(4);
+  });
+});

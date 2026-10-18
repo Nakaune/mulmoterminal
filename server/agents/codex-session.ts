@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, openSync, readSync, closeSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { isRecord } from "../../common/isRecord.js";
@@ -30,19 +30,40 @@ export function parseSessionMetaLine(line: string): CodexSessionMeta | null {
   } catch {
     return null;
   }
+  return parseSessionMetaRecord(doc);
+}
+
+export function parseSessionMetaRecord(doc: unknown): CodexSessionMeta | null {
   if (!isRecord(doc) || doc.type !== "session_meta" || !isRecord(doc.payload)) return null;
-  const { id, cwd } = doc.payload;
+  // Guardian and delegated agents create rollouts beside the interactive conversation.
+  // They must not make its cwd match ambiguous or become a terminal's resume target.
+  if (isRecord(doc.payload.source) && "subagent" in doc.payload.source) return null;
+  const { cwd } = doc.payload;
+  const id = doc.payload.id ?? doc.payload.session_id;
   if (typeof id !== "string" || !UUID_RE.test(id)) return null;
   return { id, cwd: typeof cwd === "string" ? cwd : null };
 }
 
 export function readSessionMeta(rolloutFile: string): CodexSessionMeta | null {
+  let fd: number | undefined;
   try {
-    const content = readFileSync(rolloutFile, "utf8");
-    const newline = content.indexOf("\n");
-    return parseSessionMetaLine(newline === -1 ? content : content.slice(0, newline));
+    fd = openSync(rolloutFile, "r");
+    const chunks: Buffer[] = [];
+    // Metadata can include instructions, but never read a multi-megabyte conversation
+    // just to identify it. A partial/oversized header is retried on the next probe.
+    for (let offset = 0; offset < 1024 * 1024; offset += 4096) {
+      const buffer = Buffer.alloc(4096);
+      const size = readSync(fd, buffer, 0, buffer.length, offset);
+      const part = buffer.subarray(0, size);
+      const newline = part.indexOf(10);
+      chunks.push(newline < 0 ? part : part.subarray(0, newline));
+      if (newline >= 0 || size < buffer.length) return parseSessionMetaLine(Buffer.concat(chunks).toString("utf8"));
+    }
+    return null;
   } catch {
     return null;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
 }
 
@@ -75,7 +96,7 @@ export function snapshotSessions(root: string, now: Date = new Date()): Set<stri
   return new Set(listRecentRollouts(root, now));
 }
 
-interface RolloutMeta extends CodexSessionMeta {
+export interface RolloutMeta extends CodexSessionMeta {
   file: string;
 }
 
@@ -92,7 +113,7 @@ export function pickFreshSession(root: string, before: Set<string>, cwd: string 
     .map((file) => ({ file, meta: readSessionMeta(file) }))
     .filter((x): x is { file: string; meta: CodexSessionMeta } => x.meta !== null);
   const sole = found.length === 1 ? found[0] : undefined;
-  if (sole) return { ...sole.meta, file: sole.file };
+  if (sole && (!cwd || sole.meta.cwd === cwd)) return { ...sole.meta, file: sole.file };
   const matches = cwd ? found.filter((x) => x.meta.cwd === cwd) : [];
   const soleMatch = matches.length === 1 ? matches[0] : undefined;
   if (soleMatch) return { ...soleMatch.meta, file: soleMatch.file };

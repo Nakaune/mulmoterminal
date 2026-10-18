@@ -8,6 +8,7 @@
 import { writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { spawn } from "node:child_process";
 import { isLauncherEnvVar } from "./pty-env.js";
 import { spawnCapture, spawnCaptureAsync } from "./spawnCapture.js";
 import { splitLines } from "./split-lines.js";
@@ -15,6 +16,7 @@ import { splitLines } from "./split-lines.js";
 const SERVER_SOCKET = "mulmoterminal";
 const SESSION_PREFIX = "mt-";
 const CONF_FILE = path.join(os.homedir(), ".mulmoterminal", "tmux.conf");
+const rawOutputClientPids = new Set<number>();
 
 const tmux = (args: string[]) => spawnCapture("tmux", ["-L", SERVER_SOCKET, ...args]);
 const tmuxAsync = (args: string[]) => spawnCaptureAsync("tmux", ["-L", SERVER_SOCKET, ...args]);
@@ -301,6 +303,54 @@ export function tmuxPaneCommand(id: string): string | null {
   return name === "" ? null : name;
 }
 
+/** The terminal process, not the short-lived tmux client attaching to it. */
+export function tmuxPanePid(id: string): number | null {
+  const result = tmux(["display-message", "-p", "-t", tmuxSessionName(id), "#{pane_pid}"]);
+  const value = Number(result.stdout.trim());
+  return result.status === 0 && Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+/** Repeated background inspection must not block HTTP while tmux responds. */
+export async function tmuxPanePidAsync(id: string): Promise<number | null> {
+  const result = await tmuxAsync(["display-message", "-p", "-t", tmuxSessionName(id), "#{pane_pid}"]);
+  const value = Number(result.stdout.trim());
+  return result.status === 0 && Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+/** Control mode carries the pane's raw bytes, including OSC sequences an attached
+ * terminal client consumes. This client cannot type or change the pane's size. */
+export function watchTmuxRawOutput(id: string, onOutput: (data: string) => void): () => void {
+  const child = spawn("tmux", ["-L", SERVER_SOCKET, "-C", "attach-session", "-f", "read-only,ignore-size", "-t", tmuxSessionName(id)], {
+    stdio: ["pipe", "pipe", "ignore"],
+  });
+  if (child.pid) rawOutputClientPids.add(child.pid);
+  child.on("exit", () => {
+    if (child.pid) rawOutputClientPids.delete(child.pid);
+  });
+  let pending = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => {
+    pending += chunk;
+    let end: number;
+    while ((end = pending.indexOf("\n")) >= 0) {
+      const line = pending.slice(0, end);
+      pending = pending.slice(end + 1);
+      const match = /^%output %\d+ (.*)$/.exec(line);
+      if (match) onOutput(decodeTmuxControlOutput(match[1]!));
+    }
+    if (pending.length > 1024 * 1024) pending = "";
+  });
+  child.on("error", () => undefined);
+  return () => {
+    child.stdin.end();
+    child.kill();
+  };
+}
+
+export function decodeTmuxControlOutput(data: string): string {
+  return data.replace(/\\([0-7]{3})/g, (_, octal: string) => String.fromCharCode(Number.parseInt(octal, 8)));
+}
+
 // The pane state that an application SETS ONCE and then relies on forever: which screen buffer
 // it owns, and which mouse reports it asked for. Read back as the DEC private modes that would
 // re-establish it (#1073).
@@ -414,17 +464,18 @@ export function parseAttachedClientCount(stdout: string): number | null {
 // means ANOTHER server process is holding it — the only cross-process signal we have for
 // "someone else would lose this session if we killed it".
 export function tmuxAttachedClientCount(id: string): number | null {
-  const r = tmux(["display-message", "-p", "-t", tmuxSessionName(id), "#{session_attached}"]);
-  return r.status === 0 ? parseAttachedClientCount(r.stdout) : null;
+  const r = tmux(["list-clients", "-t", tmuxSessionName(id), "-F", "#{session_name} #{client_pid}"]);
+  return r.status === 0 ? (parseTmuxClientSessions(r.stdout, rawOutputClientPids).get(id) ?? 0) : null;
 }
 
 // `list-clients -F '#{session_name}'` → how many clients each of OUR sessions carries. One line
 // per client, so a session with two holders appears twice and one with none does not appear at
 // all. Names outside our prefix belong to nobody here.
-export function parseTmuxClientSessions(stdout: string): Map<string, number> {
+export function parseTmuxClientSessions(stdout: string, ignoredPids: ReadonlySet<number> = new Set()): Map<string, number> {
   const counts = new Map<string, number>();
   for (const line of splitLines(stdout)) {
-    const name = line.trim();
+    const [name = "", pid] = line.trim().split(/\s+/);
+    if (pid && ignoredPids.has(Number(pid))) continue;
     if (!name.startsWith(SESSION_PREFIX)) continue;
     const id = name.slice(SESSION_PREFIX.length);
     counts.set(id, (counts.get(id) ?? 0) + 1);
@@ -440,8 +491,8 @@ export function parseTmuxClientSessions(stdout: string): Map<string, number> {
 // the caller can tell "nobody holds these" from "nobody could say"; isSessionAttached is where
 // that distinction is spent.
 export function tmuxAttachedCounts(): Map<string, number> | null {
-  const r = tmux(["list-clients", "-F", "#{session_name}"]);
-  return r.status === 0 ? parseTmuxClientSessions(r.stdout) : null;
+  const r = tmux(["list-clients", "-F", "#{session_name} #{client_pid}"]);
+  return r.status === 0 ? parseTmuxClientSessions(r.stdout, rawOutputClientPids) : null;
 }
 
 // Ids of sessions that survived (e.g. across a crash), for startup visibility.

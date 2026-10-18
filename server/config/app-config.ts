@@ -10,6 +10,7 @@ import {
   launcherSchema,
   customAgentSchema,
   quickCommandSchema,
+  toolbarLinkSchema,
   userMcpServerSchema,
   providerSchema,
   customThemeSchema,
@@ -23,6 +24,7 @@ import {
 } from "./config-schema.js";
 import { DEFAULT_TERMINAL_SUBMIT_MODE, isTerminalSubmitMode, type TerminalSubmitMode } from "../../common/terminalSubmit.js";
 import type { QuickCommand } from "../../common/quickCommands.js";
+import { isSafeToolbarUrl, type ToolbarLink } from "../../common/toolbarLinks.js";
 import { isCustomAgentId, type CustomAgent } from "../../common/customAgents.js";
 import { DEFAULT_PUSH_KINDS, PUSH_KINDS, type PushKind } from "../../common/pushKinds.js";
 import { DEFAULT_SOUND_KINDS, NOTIFY_KINDS, type NotifyKind } from "../../common/notifyKinds.js";
@@ -71,6 +73,9 @@ export interface AppConfig {
   // Phrases the phone offers as chips on a session's terminal view (#830), optionally
   // scoped to session kinds. Empty by default — no chips until the user adds one.
   quickCommands: QuickCommand[];
+  // Links pinned to the app toolbar, beside the notification bell. Empty by default — the
+  // toolbar shows nothing extra until the user names one.
+  toolbarLinks: ToolbarLink[];
   // User-added HTTP MCP servers merged into the single-view session's --mcp-config.
   userMcpServers: UserMcpServer[];
   // Global terminal-header action buttons; applied to every terminal (scoped with `when`).
@@ -274,6 +279,28 @@ const QUICK_COMMANDS_MAX = 20;
 // unique labels, bounded count. The label is short because it has to fit a phone chip.
 // An `agents` array that survives the schema is kept as-is; an empty one is dropped so it
 // means the same as omitting it (offered everywhere) rather than "offered to nothing".
+// Labels are trimmed and unique, the count is bounded, and the URL SCHEME is checked — an href is
+// the one field here that can run code, so a `javascript:` link is dropped rather than rendered.
+export const TOOLBAR_LINK_MAX = 6;
+
+export function sanitizeToolbarLinks(input: unknown): ToolbarLink[] {
+  if (!Array.isArray(input)) return [];
+  const seen = new Set<string>();
+  const out: ToolbarLink[] = [];
+  for (const v of input) {
+    const parsed = toolbarLinkSchema.safeParse(v);
+    if (!parsed.success) continue;
+    const label = parsed.data.label.trim();
+    const url = parsed.data.url.trim();
+    const icon = parsed.data.icon?.trim();
+    if (!label || !isSafeToolbarUrl(url) || seen.has(label)) continue;
+    seen.add(label);
+    out.push(icon ? { label, url, icon } : { label, url });
+    if (out.length >= TOOLBAR_LINK_MAX) break;
+  }
+  return out;
+}
+
 export function sanitizeQuickCommands(input: unknown): QuickCommand[] {
   if (!Array.isArray(input)) return [];
   const seen = new Set<string>();
@@ -434,6 +461,7 @@ export const emptyConfig = (): AppConfig => ({
   launchers: [],
   customAgents: [],
   quickCommands: [],
+  toolbarLinks: [],
   userMcpServers: [],
   themes: [],
   buttons: null,
@@ -518,6 +546,7 @@ function sanitizeAppConfig(raw: unknown): AppConfig {
     launchers: sanitizeLaunchers(o.launchers),
     customAgents: sanitizeCustomAgents(o.customAgents),
     quickCommands: sanitizeQuickCommands(o.quickCommands),
+    toolbarLinks: sanitizeToolbarLinks(o.toolbarLinks),
     userMcpServers: sanitizeUserMcpServers(o.userMcpServers),
     themes: sanitizeCustomThemes(o.themes),
     buttons: sanitizeButtons(o.buttons),
@@ -625,6 +654,7 @@ export function mergeConfigUpdate(base: AppConfig, body: Record<string, unknown>
     launchers: updated("launchers", sanitizeLaunchers, base.launchers),
     customAgents: updated("customAgents", sanitizeCustomAgents, base.customAgents),
     quickCommands: updated("quickCommands", sanitizeQuickCommands, base.quickCommands),
+    toolbarLinks: updated("toolbarLinks", sanitizeToolbarLinks, base.toolbarLinks),
     userMcpServers: updated("userMcpServers", sanitizeUserMcpServers, base.userMcpServers),
     themes: updated("themes", sanitizeCustomThemes, base.themes),
     buttons: updated("buttons", sanitizeButtons, base.buttons),
@@ -663,6 +693,7 @@ export function toPublicAppConfig(config: AppConfig): AppConfig {
     launchers: config.launchers,
     customAgents: config.customAgents,
     quickCommands: config.quickCommands,
+    toolbarLinks: config.toolbarLinks,
     userMcpServers: config.userMcpServers,
     themes: config.themes,
     buttons: config.buttons,

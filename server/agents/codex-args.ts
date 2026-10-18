@@ -35,7 +35,10 @@ export interface CodexArgsInput {
 // overflows tmux's new-session command-length limit ("command too long"). It is typed into codex's
 // input box after startup instead (see attachCodexAutoRun in index.ts).
 export function buildCodexArgs(input: CodexArgsInput): string[] {
-  const args: string[] = [];
+  // New conversations keep their rollout writer in this terminal's process tree.
+  // An existing conversation may still be owned by the shared daemon: resume it
+  // there rather than failing its writer lock. OSC markers report its live state.
+  const args: string[] = input.resume ? [] : ["--no-daemon"];
   if (input.model) args.push("--model", input.model);
   for (const server of input.guiMcpServers) {
     // Attach the GUI MCP over streamable HTTP and auto-approve its tools so codex can drive the

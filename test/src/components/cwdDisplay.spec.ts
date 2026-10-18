@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { homeRelative, truncateFront, formatCwd, worktreeLabel } from "../../../src/components/cwdDisplay.js";
+import { homeRelative, truncateFront, formatCwd, worktreeTail, worktreeLabel } from "../../../src/components/cwdDisplay.js";
 
 describe("homeRelative", () => {
   it("anchors a path under home on ~", () => {
@@ -61,5 +61,50 @@ describe("worktreeLabel", () => {
     expect(worktreeLabel("/Users/me/ss/proj")).toBeNull();
     expect(worktreeLabel("/x/worktrees/no-hash-here/task")).toBeNull(); // dir lacks the -<8hex> suffix
     expect(worktreeLabel("/x/worktrees/app-1a2b3c4d")).toBeNull(); // no task segment
+  });
+});
+
+describe("worktreeTail", () => {
+  it("keeps only the branch part of a wt/ worktree", () => {
+    expect(worktreeTail("~/project/wt/feat/act-formulation")).toBe("feat/act-formulation");
+    expect(worktreeTail("/home/me/project/wt/fix/a-bug")).toBe("fix/a-bug");
+  });
+
+  it("keeps a branch with no type prefix, and one with extra depth", () => {
+    expect(worktreeTail("~/project/wt/hotfix")).toBe("hotfix");
+    expect(worktreeTail("~/project/wt/feat/a/b")).toBe("feat/a/b");
+  });
+
+  // Nothing follows it, so there is no branch to show and shortening would leave the cell with no
+  // location at all.
+  it("leaves a path that ends at the wt root alone", () => {
+    expect(worktreeTail("~/project/wt")).toBe("~/project/wt");
+  });
+
+  it("leaves paths with no wt segment alone", () => {
+    expect(worktreeTail("~/project/main")).toBe("~/project/main");
+    expect(worktreeTail("~/witness/x")).toBe("~/witness/x"); // not a segment called exactly "wt"
+  });
+
+  // MulmoTerminal's own managed layout is worktreeLabel's to render; this must not touch it.
+  it("leaves the managed worktrees layout alone", () => {
+    expect(worktreeTail("~/.mulmoterminal/worktrees/proj-1a2b3c4d/task")).toBe("~/.mulmoterminal/worktrees/proj-1a2b3c4d/task");
+  });
+
+  it("handles Windows separators", () => {
+    expect(worktreeTail("~\\project\\wt\\feat\\x")).toBe("feat\\x");
+  });
+});
+
+describe("formatCwd with a worktree", () => {
+  // The whole point: what the header shows for the directory in the screenshot that started this.
+  it("shows the branch instead of the road to it", () => {
+    expect(formatCwd("/home/example/project/wt/feat/act-formulation", "/home/example")).toBe("feat/act-formulation");
+  });
+
+  it("still truncates from the front when even the branch is too long", () => {
+    const shown = formatCwd("/home/example/project/wt/feat/a-very-long-branch-name-indeed", "/home/example", 20);
+    expect(shown.startsWith("…")).toBe(true);
+    expect(shown).toHaveLength(20);
   });
 });

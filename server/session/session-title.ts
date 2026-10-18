@@ -8,13 +8,26 @@
 // generating one from that same pre-clear file, an in-flight set so a Stop hook and a roster
 // view do not both summarize, and a retry floor so a viewed-but-failing session is not
 // re-summarized on every poll.
-import path from "node:path";
 import { conversationTurnsFromParsed, isTrivialPrompt, type ConversationTurn } from "./transcript.js";
 import { forEachJsonlRecord } from "../infra/jsonl-file.js";
 import { shouldFreshenViewedTitle, shouldRegenerateTitle, TITLE_REGEN_EVERY_TURNS, VIEW_TITLE_REGEN_TURNS } from "../config/header-title.js";
-import { aiTitles, lastTitleAttemptMs, lastTitledUserTurns, titleEpoch, titleInFlight, titlePending, titleTurnCounts } from "./registry.js";
+import {
+  aiTitles,
+  codexRollouts,
+  codexRolloutsHydrated,
+  lastTitleAttemptMs,
+  lastTitledUserTurns,
+  titleEpoch,
+  titleInFlight,
+  titlePending,
+  titleTurnCounts,
+} from "./registry.js";
 import { clearedTranscripts } from "./cleared-transcripts.js";
-import { projectSessionsDir } from "./project-dir.js";
+import { transcriptFile } from "./transcript-locate.js";
+import { readCodexSummary } from "./codex-summary.js";
+import { codexSessionsRoot } from "../agents/codex-session.js";
+import { codexRolloutPath } from "../agents/codex-sessions.js";
+import type { TerminalAgent } from "../../common/sessionAgent.js";
 
 // How long a viewed session that failed to summarize waits before being tried again, so a
 // roster poll cannot spawn a summarizer per request.
@@ -30,6 +43,23 @@ export interface TitleDeps {
   // Turns, not the raw transcript: the file reaches 585 MB here and cannot be held as a string
   // at all (#998). The title only reads the last few turns anyway.
   generateTitle: (turns: ConversationTurn[]) => Promise<string | null>;
+}
+
+async function readTitleInput(sessionId: string, cwd: string, agent: TerminalAgent): Promise<{ turns: ConversationTurn[]; userTurns: number } | null> {
+  if (agent === "codex") {
+    await codexRolloutsHydrated;
+    const rollout = codexRolloutPath(codexSessionsRoot(), codexRollouts.get(sessionId)?.conversationId ?? sessionId);
+    if (!rollout) return null;
+    const summary = await readCodexSummary(rollout).catch(() => null);
+    return summary ? { turns: summary.titleTurns, userTurns: summary.userTurns } : null;
+  }
+  const turns: ConversationTurn[] = [];
+  try {
+    await forEachJsonlRecord(transcriptFile(sessionId, cwd), (record) => turns.push(...conversationTurnsFromParsed([record])));
+    return { turns, userTurns: turns.filter((turn) => turn.role === "user").length };
+  } catch {
+    return null;
+  }
 }
 
 export function createTitleManager(deps: TitleDeps) {
@@ -61,7 +91,7 @@ export function createTitleManager(deps: TitleDeps) {
   // Epoch-guarded: a /clear or teardown mid-generation bumps the epoch, so the now-stale
   // result is dropped. In-flight-guarded so overlapping triggers (a Stop hook and a roster
   // view) don't both summarize. Never throws — a failed/timed-out CLI just leaves the prior title.
-  async function generateAndStoreTitle(sessionId: string, cwd: string): Promise<void> {
+  async function generateAndStoreTitle(sessionId: string, cwd: string, agent: TerminalAgent = "claude"): Promise<void> {
     if (titleInFlight.has(sessionId)) return;
     // A cleared session has no transcript to title from: claude moved to a new one and ours is
     // frozen on the conversation the user just ended, so this is where the pre-clear title kept
@@ -74,16 +104,12 @@ export function createTitleManager(deps: TitleDeps) {
     try {
       // One streamed pass yields both what the title needs (the turns) and what the bookkeeping
       // needs (how many user turns there were), so the transcript is never held as a string.
-      const turns: ConversationTurn[] = [];
-      let read = true;
-      await forEachJsonlRecord(path.join(projectSessionsDir(cwd), `${sessionId}.jsonl`), (record) => {
-        turns.push(...conversationTurnsFromParsed([record]));
-      }).catch(() => (read = false));
-      const title = read && turns.length ? await deps.generateTitle(turns) : null;
+      const input = await readTitleInput(sessionId, cwd, agent);
+      const title = input?.turns.length ? await deps.generateTitle(input.turns) : null;
       if (title && (titleEpoch.get(sessionId) ?? 0) === epoch) {
         aiTitles.set(sessionId, title);
         titleTurnCounts.set(sessionId, 0);
-        lastTitledUserTurns.set(sessionId, turns.filter((t) => t.role === "user").length);
+        lastTitledUserTurns.set(sessionId, input?.userTurns ?? 0);
         deps.publishActivity(sessionId);
       }
     } finally {
@@ -93,16 +119,16 @@ export function createTitleManager(deps: TitleDeps) {
 
   // At Stop (the assistant's reply is now on disk), regenerate a pending title from the
   // recent turns and publish it. Fire-and-forget; a failure leaves the last prompt showing.
-  async function maybeGenerateTitle(sessionId: string, cwd: string | undefined): Promise<void> {
+  async function maybeGenerateTitle(sessionId: string, cwd: string | undefined, agent: TerminalAgent = "claude"): Promise<void> {
     if (!cwd || !titlePending.has(sessionId) || titleInFlight.has(sessionId)) return;
     titlePending.delete(sessionId);
-    await generateAndStoreTitle(sessionId, cwd);
+    await generateAndStoreTitle(sessionId, cwd, agent);
   }
 
   // The grid roster summarizes on our side even for sessions the hook path never runs on
   // (unmanaged / resumed / post-restart), so it never shows a stale externally-written title.
   // Fire-and-forget from the view; the freshened title lands on the next roster poll.
-  function freshenRosterTitle(sessionId: string, cwd: string, currentUserTurns: number): void {
+  function freshenRosterTitle(sessionId: string, cwd: string, currentUserTurns: number, agent: TerminalAgent = "claude"): void {
     if (titleInFlight.has(sessionId)) return;
     const stale = shouldFreshenViewedTitle({
       lastTitledUserTurns: lastTitledUserTurns.get(sessionId) ?? null,
@@ -113,7 +139,7 @@ export function createTitleManager(deps: TitleDeps) {
     const now = deps.now();
     if (now - (lastTitleAttemptMs.get(sessionId) ?? 0) < VIEW_TITLE_RETRY_MS) return;
     lastTitleAttemptMs.set(sessionId, now);
-    void generateAndStoreTitle(sessionId, cwd);
+    void generateAndStoreTitle(sessionId, cwd, agent);
   }
   return { forgetTitle, noteTitleTurn, maybeGenerateTitle, freshenRosterTitle };
 }

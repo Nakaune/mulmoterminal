@@ -32,6 +32,8 @@ import {
   isFailedWorker,
 } from "./registry.js";
 import { clearedTranscripts, forgetClearedTranscript } from "./cleared-transcripts.js";
+import { forgetLiveCwd } from "./live-cwd.js";
+import { forgetTranscriptLocation } from "./transcript-locate.js";
 import { parseWaitGraceMs, reapDecisionFor, reapTimerDelay, shouldForgetActivity } from "./reap-policy.js";
 import { sessionRow, shouldRefreshReply } from "./activity-transition.js";
 import { flagEffect, type ActivityFlag } from "./activity-flag.js";
@@ -42,6 +44,7 @@ import { cleanupSessionDrops } from "./session-drops.js";
 import { runCompletionHook } from "./completion-hooks.js";
 import { messageOf } from "../errors.js";
 import { tmuxKillSession } from "../infra/tmux.js";
+import type { PtyEntry } from "./types.js";
 
 // The channel every session row is published on.
 export const SESSIONS_CHANNEL = "sessions";
@@ -97,18 +100,34 @@ function cancelReap(id: string) {
   }
 }
 
+function activityUnknown(entry: PtyEntry): boolean {
+  return entry.agent === "codex" && !entry.codexRolloutBound && entry.codexTerminalState === undefined;
+}
+
 function scheduleReap(deps: SessionLifecycleDeps, id: string, delayMs: number = REAP_GRACE_MS) {
   // null => never auto-reap; the session stays until reattached or explicitly
   // terminated (see reapTimerDelay for why a bad value must not reach setTimeout).
   const delay = reapTimerDelay(delayMs);
   if (delay === null) return;
   if (reapTimers.has(id)) return;
+  const scheduledEntry = ptys.get(id);
   reapTimers.set(
     id,
     setTimeout(() => {
       reapTimers.delete(id);
       const entry = ptys.get(id);
-      if (entry && !entry.ws) reap(deps, id); // still detached after the grace window
+      if (!entry || entry !== scheduledEntry || entry.ws || activityUnknown(entry)) return;
+      const current = reapDecisionFor(
+        activity.get(id),
+        { idleMs: REAP_GRACE_MS, waitingMs: WAIT_REAP_GRACE_MS },
+        { connectionDropped: entry.connectionDropped === true },
+      );
+      if (current.kind === "keep") return;
+      if (current.delayMs !== delayMs) {
+        scheduleReap(deps, id, current.delayMs);
+        return;
+      }
+      reap(deps, id);
     }, delay),
   );
 }
@@ -126,9 +145,20 @@ function armReapForDetached(deps: SessionLifecycleDeps, id: string) {
   // last arm, and a stale short timer must not survive to reap a session that now
   // needs the user. cancelReap clears it so scheduleReap re-arms with the right grace.
   cancelReap(id);
-  const decision = reapDecisionFor(activity.get(id), { idleMs: REAP_GRACE_MS, waitingMs: WAIT_REAP_GRACE_MS });
+  const decision = reapDecisionFor(
+    activity.get(id),
+    { idleMs: REAP_GRACE_MS, waitingMs: WAIT_REAP_GRACE_MS },
+    { connectionDropped: entry.connectionDropped === true, activityUnknown: activityUnknown(entry) },
+  );
   if (decision.kind === "keep") {
-    console.log(`[pty] keeping working session ${id} alive (detached)`);
+    // Named apart, because "the network went" and "it is still thinking" look identical from
+    // the outside: a session that never gets reaped is a leak or a rescue depending on which
+    // one it was, and only this line says which.
+    console.log(
+      entry.connectionDropped
+        ? `[pty] keeping ${id} alive — the connection dropped, it was not closed (detached)`
+        : `[pty] keeping working session ${id} alive (detached)`,
+    );
     return;
   }
   scheduleReap(deps, id, decision.delayMs);
@@ -151,6 +181,8 @@ function reap(deps: SessionLifecycleDeps, id: string) {
   // The transcript stops being frozen here: the next claude on this id (`--resume`, or a restart
   // after `/exit` — which reaches reap through term.onExit) appends to that file again.
   forgetClearedTranscript(id);
+  forgetLiveCwd(id);
+  forgetTranscriptLocation(id);
   deps.forgetTitle(id);
   deps.sessionActivityPublisher.forget(id); // drop the phone's copy so its picker has no ghosts
   deps.forgetWorkPhase(id); // the live turn dies with the session

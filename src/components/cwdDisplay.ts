@@ -22,9 +22,27 @@ export function truncateFront(s: string, max: number): string {
   return s.length <= max ? s : `…${s.slice(s.length - (max - 1))}`;
 }
 
+// A git worktree kept under a `wt/` root — the common `<repo>/wt/<type>/<name>` layout — shows the
+// branch, not the road to it. "~/project/wt/feat/act-formulation" is 34 characters of which only
+// the last 20 differ between cells, and the header truncates from the FRONT, so the part that
+// identifies the cell is exactly the part at risk.
+//
+// `wt` and not `worktrees`: that other name is MulmoTerminal's own managed layout, which
+// worktreeLabel already renders as "<repo> (<task>)". Shortening it here as well would leave the
+// two disagreeing about the same path.
+//
+// The LAST `wt` segment wins, and a path ENDING in `wt` is left alone — there is no branch after
+// it to show, and returning "" would lose the cell's only location cue.
+export function worktreeTail(shown: string): string {
+  const parts = shown.split(/[/\\]/u);
+  const at = parts.lastIndexOf("wt");
+  if (at < 0 || at === parts.length - 1) return shown;
+  return parts.slice(at + 1).join(shown.includes("\\") ? "\\" : "/");
+}
+
 export function formatCwd(cwd: string | null, home: string | null, max = 30): string {
   if (!cwd) return "";
-  return truncateFront(homeRelative(cwd, home), max);
+  return truncateFront(worktreeTail(homeRelative(cwd, home)), max);
 }
 
 // A managed worktree's cwd looks like .../worktrees/<repo>-<8hex>/<task> (see the

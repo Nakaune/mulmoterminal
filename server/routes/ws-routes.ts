@@ -16,7 +16,8 @@ import { getHeaderConfig } from "../config/config-routes.js";
 import { buildHeaderContext, loadHeaderConfig } from "../config/header-context.js";
 import { resolveButtonCommand, shellQuoteFor } from "../config/header-resolve.js";
 import { resolveScript } from "../files/scripts.js";
-import { tmuxHasSession } from "../infra/tmux.js";
+import { tmuxHasSession, tmuxPaneCommand } from "../infra/tmux.js";
+import type { SessionAgent } from "../../common/sessionAgent.js";
 import { launchChoiceFromParams } from "../session/launch-choice.js";
 import { codexSessionsRoot } from "../agents/codex-session.js";
 import { antigravityBrainRoot, antigravityConversationExists } from "../agents/antigravity-session.js";
@@ -39,9 +40,17 @@ import { TOOL_GROUPS, type ToolGroup } from "../../common/toolGroups.js";
 import { parseTerminalSize, type TerminalSize } from "../../common/terminalSize.js";
 import { handleCommandFrame } from "../session/pty-connection.js";
 import { closeWithError } from "../session/ws-frames.js";
+import { replayLiveCwd } from "../session/live-cwd.js";
 import { ProviderRefusedError } from "../session/provider-env.js";
 import { sessionExistsOnDisk } from "../session/session-reads.js";
-import { canStartLauncher, isContinuingSession, resolveReattachableId, resolveSession, type SessionResolution } from "../session/session-resolve.js";
+import {
+  canStartLauncher,
+  isContinuingSession,
+  resolveReattachableId,
+  resolveSession,
+  servesAgent,
+  type SessionResolution,
+} from "../session/session-resolve.js";
 import type { PtyEntry } from "../session/types.js";
 import type {
   SpawnClaudePty,
@@ -70,7 +79,7 @@ export interface WsRouteDeps {
   setWaiting: (id: string, waiting: boolean) => void;
   reattachPty: (entry: PtyEntry, ws: WebSocket, sessionId: string) => PtyEntry;
   handleClientFrame: (entry: PtyEntry, ws: WebSocket, raw: { toString(): string }, sessionId: string) => void;
-  handleClientClose: (entry: PtyEntry, ws: WebSocket, sessionId: string) => void;
+  handleClientClose: (entry: PtyEntry, ws: WebSocket, sessionId: string, closeCode?: number) => void;
   spawnClaudePty: SpawnClaudePty;
   spawnCodexPty: SpawnCodexPty;
   spawnAntigravityPty: SpawnAntigravityPty;
@@ -95,9 +104,18 @@ export interface WsRouteDeps {
 // resolvable launcher index still reattaches via this harmless fallback.
 const DEFAULT_LAUNCH_CMD = process.env.SHELL || "/bin/sh";
 
+// The rule is in session-resolve.ts; what is here is the REPORT. A refusal is silent to the user —
+// they get a working new session — so without this line the only trace that a browser is still
+// sending a stale id is the symptom it no longer produces.
+function serves(id: string, running: string | null | undefined, agent: SessionAgent | undefined): boolean {
+  if (servesAgent(running, agent)) return true;
+  console.warn(`[ws/${agent}] ${id} is a live ${running} session — starting a fresh ${agent} session instead of reattaching it`);
+  return false;
+}
+
 function resolveClaudeSession(requested: string | null, cwd: string): SessionResolution {
-  const hasLivePty = !!requested && ptys.has(requested);
-  const tmuxAlive = !hasLivePty && !!requested && tmuxHasSession(requested);
+  const hasLivePty = !!requested && ptys.has(requested) && serves(requested, ptys.get(requested)?.agent, "claude");
+  const tmuxAlive = !hasLivePty && !!requested && tmuxHasSession(requested) && serves(requested, tmuxPaneCommand(requested), "claude");
   const onDisk = !hasLivePty && !!requested && sessionExistsOnDisk(requested, cwd);
   return resolveSession(requested, { hasLivePty, tmuxAlive, onDisk }, randomUUID);
 }
@@ -253,7 +271,7 @@ async function admitAgentSession(
   markAttachedSessionPlaced(sessionId, requested);
   // The EFFECTIVE cwd, not this request's: on a reattach the live PTY's own directory is where the
   // agent really runs, and the request's `?cwd=` is ignored by everything downstream.
-  return announceSession(ws, sessionId, live?.cwd ?? cwd);
+  return announceSession(ws, sessionId, live?.cwd ?? cwd, !!live);
 }
 
 async function resolveButtonRun(url: URL, cwd: string): Promise<{ command: string; cwd: string } | null> {
@@ -352,9 +370,14 @@ export function beginRunTerminal(deps: WsRouteDeps, ws: WebSocket, resolved: { c
  *  `hasLivePty` is `!!live` rather than a separate `ptys.has`, which is what it always meant —
  *  the map holds no undefined entries — and saying it once removes the chance of the two answers
  *  parting company. */
-function liveSessionFacts(requested: string | null): { hasLivePty: boolean; live: PtyEntry | undefined; tmuxAlive: boolean } {
-  const live = requested ? ptys.get(requested) : undefined;
-  const tmuxAlive = !live && !!requested && tmuxHasSession(requested);
+function liveSessionFacts(requested: string | null, agent?: SessionAgent): { hasLivePty: boolean; live: PtyEntry | undefined; tmuxAlive: boolean } {
+  const found = requested ? ptys.get(requested) : undefined;
+  // `agent` is absent for the launcher, which runs the user's own command line: what is in that
+  // pane is its business, and reattaching it regardless of the index is the documented behaviour.
+  const live = found && requested && serves(requested, found.agent, agent) ? found : undefined;
+  // `!found`, not `!live`: an id whose live pty belongs to someone else must not fall through to
+  // the tmux branch either, or the id is kept and `tmux new-session -A` attaches that same program.
+  const tmuxAlive = !found && !!requested && tmuxHasSession(requested) && serves(requested, tmuxPaneCommand(requested), agent);
   return { hasLivePty: !!live, live, tmuxAlive };
 }
 
@@ -378,9 +401,10 @@ interface ResumableSession {
  */
 function resolveResumableSession(
   requested: string | null,
+  agent: SessionAgent,
   resumeIdFor: (facts: { hasLivePty: boolean; tmuxAlive: boolean }) => string | null,
 ): ResumableSession {
-  const { hasLivePty, live, tmuxAlive } = liveSessionFacts(requested);
+  const { hasLivePty, live, tmuxAlive } = liveSessionFacts(requested, agent);
   const resumeConversationId = resumeIdFor({ hasLivePty, tmuxAlive });
   const { sessionId } = resolveReattachableId(requested, { hasLivePty, tmuxAlive, canResume: !!resumeConversationId }, randomUUID);
   return { sessionId, live, resumeConversationId };
@@ -419,7 +443,7 @@ function resolveLaunchSession(
 // pty / surviving tmux session (running codex picked up, no resume); else cold-resume a known
 // rollout id; else a fresh session (a new minted key).
 function resolveCodexSession(requested: string | null): { sessionId: string; live: PtyEntry | undefined; resumeRolloutId: string | null } {
-  const { sessionId, live, resumeConversationId } = resolveResumableSession(requested, ({ hasLivePty, tmuxAlive }) =>
+  const { sessionId, live, resumeConversationId } = resolveResumableSession(requested, "codex", ({ hasLivePty, tmuxAlive }) =>
     agentResumeId(requested, {
       mappedId: requested ? codexRollouts.get(requested)?.conversationId : null,
       conversationExists: () => !!requested && codexRolloutExists(codexSessionsRoot(), requested),
@@ -573,15 +597,19 @@ export function startAndWire(
   applyClientSize(entry.term, session.size ?? null, session.tag, session.id);
   const deliver = (raw: { toString(): string }) => deps.handleClientFrame(entry, ws, raw, session.id);
   ws.on("message", deliver);
-  ws.on("close", () => deps.handleClientClose(entry, ws, session.id));
+  // The code comes off the socket itself: 1006 for one that broke, a real code for one the
+  // client closed. Dropping it here is what made a network blip indistinguishable from a
+  // deliberate close, and reap the session either way.
+  ws.on("close", (code: number) => deps.handleClientClose(entry, ws, session.id, code));
   session.early.release(deliver);
 }
 
 // Tell the browser which session this is, and from that moment collect what it sends: its first
 // frame is the terminal's real geometry, and it arrives while the caller is still reading config
 // files, so without this it lands on the floor (see early-frames.ts).
-function announceSession(ws: WebSocket, sessionId: string, cwd: string): EarlyFrames {
+function announceSession(ws: WebSocket, sessionId: string, cwd: string, _reattached = false): EarlyFrames {
   ws.send(JSON.stringify({ type: "session", id: sessionId, cwd }));
+  replayLiveCwd(ws, sessionId, cwd);
   return bufferEarlyFrames(ws);
 }
 
@@ -673,7 +701,7 @@ async function handleCodexConnection(deps: WsRouteDeps, ws: WebSocket, req: WsUp
 }
 
 function resolveAntigravitySession(requested: string | null): ResumableSession {
-  return resolveResumableSession(requested, ({ hasLivePty, tmuxAlive }) =>
+  return resolveResumableSession(requested, "antigravity", ({ hasLivePty, tmuxAlive }) =>
     // The same rule codex resumes by, including the part that is easy to drop: the key is only
     // treated as a conversation id when a conversation by that name EXISTS. Without the check every
     // key resumes, which means a stale one is handed to `agy --conversation` — agy answers a
@@ -699,7 +727,7 @@ function resolveAntigravitySession(requested: string | null): ResumableSession {
 // the conversation where `--session-id <id>` ABORTS ("Session ID … is already in use", measured).
 // Withholding the resume in that window makes the window fatal.
 function resolveGrokSession(requested: string | null, cwd: string): ResumableSession {
-  return resolveResumableSession(requested, ({ hasLivePty }) =>
+  return resolveResumableSession(requested, "grok", ({ hasLivePty }) =>
     // Only when a conversation by that name EXISTS in this directory. Without the check every key
     // resumes, which means a stale one is handed to `grok --resume` — and an agent asked for a
     // conversation it cannot find starts a fresh one, silently, under the old session's id.

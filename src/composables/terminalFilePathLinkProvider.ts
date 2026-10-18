@@ -1,12 +1,24 @@
-// Turns file paths in xterm terminal output into clickable links, scoped to the session's
-// cwd. WHAT a click opens is chosen by extension (ROUTE_BY_EXTENSION / IN_APP_EXTENSIONS
-// below) — the raw route is only the fallback. Registered next to WebLinksAddon, which
-// handles http/https URLs.
+// Turns file paths in xterm terminal output into clickable links. Registered next to
+// WebLinksAddon, which handles http/https URLs.
+//
+// ── LOCAL FORK ────────────────────────────────────────────────────────────────────────
+// A click REVEALS the path in the OS file manager (Windows Explorer, via /api/open-dir)
+// instead of opening it inside the app. Upstream routes the click by extension into the
+// in-app viewers, which is scoped to the session's cwd — and this workspace's agents
+// print paths in sibling worktrees and under ~/.claude constantly, where every such click
+// died on "path escapes the serving root". Explorer has no such scope.
+//
+// That holds on the server's own desktop. A browser on another machine never sees the
+// Explorer window, so there the click opens in the app after all — see remoteFileOpen.
+//
+// The extension tables below are upstream's routing. On the desktop they no longer decide
+// what a CLICK does; they route the remote click, `isPaneViewable` still answers for the
+// Files pane, and the rest is kept so this fork stays a small diff to rebase.
+// ──────────────────────────────────────────────────────────────────────────────────────
 //
 // ── DOCS ──────────────────────────────────────────────────────────────────────────────
-// That routing is a documented, user-facing spec. Change or extend it and update all
-// three in the same commit — they went stale together once and stayed wrong for a
-// release (#834):
+// What a click does is a documented, user-facing spec. Change it and update all three in
+// the same commit — they went stale together once and stayed wrong for a release (#834):
 //   1. README.md — "Clicking a file path" (the canonical table)
 //   2. docs/guide/en/features.md + docs/guide/ja/features.md — the file-path row, BOTH
 //   3. docs/terminal-notes.md — the link-mechanisms table
@@ -132,12 +144,9 @@ function readCells(term: Terminal, bufferLineNumber: number): TerminalCell[] | n
 export function createFilePathLinkProvider(
   term: Terminal,
   getCwd: () => string | null,
-  openUrl: (url: string) => void,
-  openInFiles: (filePath: string, cwd: string) => void,
-  // First chance at the click, ahead of the extension table: the Files pane beside an enlarged
-  // cell, which can show most of these WITHOUT leaving the grid (#910). Returns whether it took
-  // it; false falls through to the routing below, unchanged.
-  openInPane: (filePath: string, cwd: string) => boolean,
+  // Show the clicked path in the OS file manager. `cwd` is the session's directory, so a path
+  // printed relative to it resolves the way it does in that terminal.
+  reveal: (filePath: string, cwd: string) => void,
 ): ILinkProvider {
   return {
     provideLinks(bufferLineNumber: number, callback: (links: ILink[] | undefined) => void): void {
@@ -148,12 +157,7 @@ export function createFilePathLinkProvider(
         text: link.text,
         range: { start: { x: link.startX, y: bufferLineNumber }, end: { x: link.endX, y: bufferLineNumber } },
         decorations: { pointerCursor: true, underline: true },
-        activate: () => {
-          if (openInPane(link.text, cwd)) return;
-          const target = fileLinkTarget(link.text, cwd);
-          if (target.kind === "files") openInFiles(link.text, cwd);
-          else openUrl(target.url);
-        },
+        activate: () => reveal(link.text, cwd),
       }));
       callback(links.length ? links : undefined);
     },

@@ -11,9 +11,12 @@ describe("useRosterAlert", () => {
   beforeEach(() => localStorage.clear());
   afterEach(() => vi.restoreAllMocks());
 
-  it("blinks by default — a user who has never opened Settings gets the signal", async () => {
+  // Default OFF (#1131 の既定を反転): the waiting row already carries an amber edge and wash, so
+  // the motion is the part that is worth asking for rather than the part worth imposing. Someone
+  // who has never opened Settings gets the colour and no movement.
+  it("does not blink by default — the row is still marked, just still", async () => {
     const { blink } = await load();
-    expect(blink.value).toBe(true);
+    expect(blink.value).toBe(false);
   });
 
   it("remembers being turned off", async () => {
@@ -24,22 +27,27 @@ describe("useRosterAlert", () => {
     expect(blink.value).toBe(false);
   });
 
-  it("comes back on, and persists that too", async () => {
+  // The RELOAD is the point, not the write. With the default off, a reader that only knows how to
+  // recognise "off" hands back the default for every other value — including the "on" it just
+  // wrote — so turning the motion on would last exactly one page. Asserting the stored string
+  // alone cannot see that.
+  it("comes back on, and survives a reload", async () => {
     localStorage.setItem("rosterAlertBlink", "off");
     const { blink, setBlink } = await load();
     expect(blink.value).toBe(false);
     setBlink(true);
     expect(blink.value).toBe(true);
     expect(localStorage.getItem("rosterAlertBlink")).toBe("on");
+    expect((await load()).blink.value).toBe(true);
   });
 
-  // Only the explicit "off" is off. Anything else is someone who never chose, and the default is
-  // what they should get — not a silent opt-out from a value we cannot read.
+  // Only the explicit "on" is on. Anything else is someone who never chose, and the default is
+  // what they should get — not motion switched on by a value we cannot read.
   it("treats a blank or unrecognised stored value as the default", async () => {
-    for (const stored of ["", "  ", "false", "0", "nope"]) {
+    for (const stored of ["", "  ", "true", "1", "nope"]) {
       localStorage.setItem("rosterAlertBlink", stored);
       const { blink } = await load();
-      expect(blink.value).toBe(true);
+      expect(blink.value).toBe(false);
     }
   });
 
@@ -50,11 +58,11 @@ describe("useRosterAlert", () => {
       throw new Error("blocked");
     });
     const { blink, setBlink } = await load();
-    expect(blink.value).toBe(true);
+    expect(blink.value).toBe(false);
     vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
       throw new Error("blocked");
     });
-    expect(() => setBlink(false)).not.toThrow();
-    expect(blink.value).toBe(false);
+    expect(() => setBlink(true)).not.toThrow();
+    expect(blink.value).toBe(true);
   });
 });

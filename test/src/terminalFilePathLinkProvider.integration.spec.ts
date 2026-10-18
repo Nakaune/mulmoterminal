@@ -35,16 +35,8 @@ async function writeLine(term: Terminal, text: string): Promise<void> {
   await new Promise<void>((resolve) => term.write(text, resolve));
 }
 
-function provideLinks(
-  term: Terminal,
-  cwd: string | null,
-  open: (url: string) => void,
-  openInFiles: (filePath: string, cwd: string) => void = () => {},
-  // Nothing enlarged is the default for these cases, so the pane declines and the routing
-  // below it is what gets exercised.
-  openInPane: (filePath: string, cwd: string) => boolean = () => false,
-): ILink[] | undefined {
-  const provider = createFilePathLinkProvider(term, () => cwd, open, openInFiles, openInPane);
+function provideLinks(term: Terminal, cwd: string | null, reveal: (filePath: string, cwd: string) => void = () => {}): ILink[] | undefined {
+  const provider = createFilePathLinkProvider(term, () => cwd, reveal);
   let result: ILink[] | undefined;
   provider.provideLinks(1, (links) => {
     result = links;
@@ -53,13 +45,13 @@ function provideLinks(
 }
 
 describe("createFilePathLinkProvider against real xterm", () => {
-  it("linkifies the path after CJK text and opens the cwd-scoped raw URL", async () => {
+  it("linkifies the path after CJK text and reveals it with the session cwd", async () => {
     const term = new Terminal({ cols: 120, rows: 10, allowProposedApi: true });
     term.open(document.createElement("div"));
     await writeLine(term, "添付（dir/a.gif）");
 
-    const open = vi.fn();
-    const links = provideLinks(term, "/Users/me/proj", open);
+    const reveal = vi.fn();
+    const links = provideLinks(term, "/Users/me/proj", reveal);
     if (!links) throw new Error("expected the provider to return links");
     expect(links).toHaveLength(1);
 
@@ -69,55 +61,29 @@ describe("createFilePathLinkProvider against real xterm", () => {
     expect(link.range).toEqual({ start: { x: 7, y: 1 }, end: { x: 15, y: 1 } });
 
     link.activate(new MouseEvent("click"), link.text);
-    expect(open).toHaveBeenCalledWith("/api/files/raw?cwd=%2FUsers%2Fme%2Fproj&path=dir%2Fa.gif");
+    expect(reveal).toHaveBeenCalledWith("dir/a.gif", "/Users/me/proj");
 
     term.dispose();
   });
 
-  // The other arm of activate(): a source path never opens a tab, it hands the path to the
-  // app's Files view (#808).
-  it("hands a clicked source path to the Files view instead of opening a tab", async () => {
-    const term = new Terminal({ cols: 120, rows: 10, allowProposedApi: true });
-    term.open(document.createElement("div"));
-    await writeLine(term, "see src/main.ts for details");
-
-    const open = vi.fn();
-    const openInFiles = vi.fn();
-    const links = provideLinks(term, "/Users/me/proj", open, openInFiles);
-    if (!links) throw new Error("expected the provider to return links");
-
-    const [link] = links;
-    expect(link.text).toBe("src/main.ts");
-    link.activate(new MouseEvent("click"), link.text);
-    expect(openInFiles).toHaveBeenCalledWith("src/main.ts", "/Users/me/proj");
-    expect(open).not.toHaveBeenCalled();
-
-    term.dispose();
-  });
-
-  // The pane gets first refusal (#910). Taking the click has to stop BOTH of the routes
-  // below it — a path that opened in the pane and also in a new tab would be the worst of
-  // each, and the tab is what the pane exists to avoid.
-  it("stops at the pane when it takes the click, opening neither a tab nor the Files view", async () => {
+  // Every kind goes the same way now: the extension decided the route upstream, and in this
+  // fork it decides nothing — a source file, a document and an image all reach the file manager.
+  it("reveals every clicked path regardless of extension", async () => {
     const term = new Terminal({ cols: 120, rows: 10, allowProposedApi: true });
     term.open(document.createElement("div"));
     await writeLine(term, "see src/main.ts and docs/a.md and dir/a.gif");
 
-    const open = vi.fn();
-    const openInFiles = vi.fn();
-    const openInPane = vi.fn(() => true);
-    const links = provideLinks(term, "/Users/me/proj", open, openInFiles, openInPane);
+    const reveal = vi.fn();
+    const links = provideLinks(term, "/Users/me/proj", reveal);
     if (!links) throw new Error("expected the provider to return links");
     expect(links.map((l) => l.text)).toEqual(["src/main.ts", "docs/a.md", "dir/a.gif"]);
 
     links.forEach((link) => link.activate(new MouseEvent("click"), link.text));
-    expect(openInPane.mock.calls).toEqual([
+    expect(reveal.mock.calls).toEqual([
       ["src/main.ts", "/Users/me/proj"],
       ["docs/a.md", "/Users/me/proj"],
       ["dir/a.gif", "/Users/me/proj"],
     ]);
-    expect(open).not.toHaveBeenCalled();
-    expect(openInFiles).not.toHaveBeenCalled();
 
     term.dispose();
   });
@@ -126,7 +92,7 @@ describe("createFilePathLinkProvider against real xterm", () => {
     const term = new Terminal({ cols: 80, rows: 10, allowProposedApi: true });
     term.open(document.createElement("div"));
     await writeLine(term, "dir/a.gif");
-    expect(provideLinks(term, null, vi.fn())).toBeUndefined();
+    expect(provideLinks(term, null)).toBeUndefined();
     term.dispose();
   });
 });

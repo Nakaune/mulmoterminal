@@ -1,8 +1,9 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mount, flushPromises } from "@vue/test-utils";
 import AppToolbar from "../../../src/components/AppToolbar.vue";
 import { router } from "../../../src/router/index";
 import { prsGotoIndex } from "../../../src/composables/usePrsView";
+import { useAppConfig } from "../../../src/composables/useAppConfig";
 
 // The toolbar is ONE component rendered by both views (GridView and App), so which buttons
 // it offers is decided by the route, not by a prop (#886).
@@ -14,10 +15,10 @@ const labelsOf = (wrapper: ReturnType<typeof mount>): string[] =>
     .map((b) => b.attributes("aria-label") ?? b.attributes("title") ?? "")
     .filter(Boolean);
 
-const mountAt = async (path: string) => {
+const mountAt = async (path: string, props: Record<string, unknown> = {}) => {
   await router.push(path);
   await settle();
-  const wrapper = mount(AppToolbar, { global: { plugins: [router], stubs: { NotificationBell: true, RemoteHostControl: true } } });
+  const wrapper = mount(AppToolbar, { props, global: { plugins: [router], stubs: { NotificationBell: true, RemoteHostControl: true } } });
   await settle();
   return wrapper;
 };
@@ -200,5 +201,85 @@ describe("AppToolbar view-switch grouping", () => {
   it("leaves the revealed siblings out of the group", async () => {
     const group = switchGroup(await mountAt("/collections"));
     expect(group.findAll("button").map((b) => b.attributes("aria-label"))).toEqual(["Grid view", "Collections"]);
+  });
+});
+
+// 「ベルの左横」は並び順そのものが仕様なので、存在ではなく順序を押さえる。useAppConfig の
+// state は singleton なので、触ったら必ず戻す (他の case が見る同じ ref).
+describe("AppToolbar pinned links", () => {
+  const { toolbarLinks } = useAppConfig();
+  afterEach(() => {
+    toolbarLinks.value = [];
+  });
+
+  it("puts a configured link immediately left of the notification bell", async () => {
+    toolbarLinks.value = [{ label: "開発ヒートマップ", url: "http://localhost:34567/h.html", icon: "calendar_month" }];
+    const w = await mountAt("/terminals");
+    const html = w.html();
+    const link = html.indexOf('data-testid="toolbar-link"');
+    const bell = html.indexOf("notification-bell-stub");
+    expect(link).toBeGreaterThan(-1);
+    expect(bell).toBeGreaterThan(link);
+    const anchor = w.get('[data-testid="toolbar-link"]');
+    expect(anchor.attributes("href")).toBe("http://localhost:34567/h.html");
+    expect(anchor.attributes("title")).toBe("開発ヒートマップ");
+    // 新しいタブで開く。ツールバーは常時見えている枠なので、ここで遷移すると作業中の
+    // グリッドごと差し替わる。
+    expect(anchor.attributes("target")).toBe("_blank");
+    expect(anchor.attributes("rel")).toContain("noopener");
+    expect(anchor.text()).toContain("calendar_month");
+  });
+
+  // icon を省いた設定が 30px の空白にならないこと。
+  it("falls back to a glyph when the link names no icon", async () => {
+    toolbarLinks.value = [{ label: "Docs", url: "https://example.com/" }];
+    const w = await mountAt("/terminals");
+    expect(w.get('[data-testid="toolbar-link"]').text()).toBe("link");
+  });
+
+  // `ml-auto` moved from the bell to the cluster that now wraps it (the phone layout gives that
+  // cluster a row of its own, where a margin on one member inside it would push the wrong thing).
+  // What the test is for is unchanged: with no links configured, the right-hand block is still
+  // pushed to the right rather than sitting against the nav.
+  it("draws nothing, and leaves the right-hand cluster where it was, when none are configured", async () => {
+    const w = await mountAt("/terminals");
+    expect(w.find('[data-testid="toolbar-link"]').exists()).toBe(false);
+    expect(w.html()).toContain("ml-auto");
+  });
+});
+
+// Twelve controls and three gauges do not fit on a 390px row — measured, and what they do instead
+// is render as an unreadable smear. The phone header keeps the four that cannot wait and puts the
+// rest one tap away.
+describe("AppToolbar (phone)", () => {
+  const buttonsOf = (w: ReturnType<typeof mount>) => w.findAll("button").map((b) => b.attributes("aria-label") ?? "");
+
+  it("hides the nav until the disclosure is opened", async () => {
+    const w = await mountAt("/terminals", { phone: true });
+    expect(w.find("nav[aria-label='Views']").exists()).toBe(false);
+    await w.get('button[aria-label="Show the rest of the toolbar"]').trigger("click");
+    expect(w.find("nav[aria-label='Views']").exists()).toBe(true);
+  });
+
+  // The three that stay: New terminal (the reason to open the app), the bell (what brought you to
+  // it), and Settings (the door people look for when something is wrong) — plus the disclosure
+  // that holds the rest.
+  it("keeps the controls that cannot wait on the title row", async () => {
+    const labels = buttonsOf(await mountAt("/terminals", { phone: true }));
+    expect(labels).toEqual(expect.arrayContaining(["New terminal", "Settings", "Show the rest of the toolbar"]));
+  });
+
+  // Offered once, not twice: the nav has an `add` of its own, which would be a second New terminal
+  // on the same screen the moment the disclosure opened.
+  it("does not offer New terminal twice when the disclosure is open", async () => {
+    const w = await mountAt("/terminals", { phone: true });
+    await w.get('button[aria-label="Show the rest of the toolbar"]').trigger("click");
+    expect(buttonsOf(w).filter((l) => l === "New terminal")).toHaveLength(1);
+  });
+
+  it("leaves the desktop header alone", async () => {
+    const w = await mountAt("/terminals");
+    expect(w.find("nav[aria-label='Views']").exists()).toBe(true);
+    expect(buttonsOf(w)).not.toContain("Show the rest of the toolbar");
   });
 });

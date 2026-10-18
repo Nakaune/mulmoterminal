@@ -13,7 +13,22 @@ import {
   redrawTargets,
   planMsOverride,
   MS_OVERRIDE_ENTRY,
+  decodeTmuxControlOutput,
 } from "../../../server/infra/tmux";
+
+describe("tmux control output", () => {
+  it("excludes only our observer PID from occupancy", () => {
+    expect([...parseTmuxClientSessions("mt-a 10\nmt-a 11\nmt-b 12\n", new Set([11]))]).toEqual([
+      ["a", 1],
+      ["b", 1],
+    ]);
+    expect([...parseTmuxClientSessions("mt-a 10\nmt-a 11\n", new Set([12]))]).toEqual([["a", 2]]);
+  });
+  it("restores escaped OSC and literal backslashes without decoding twice", () => {
+    expect(decodeTmuxControlOutput("\\033]7501;state=working:app=codex\\033\\134")).toBe("\u001b]7501;state=working:app=codex\u001b\\");
+    expect(decodeTmuxControlOutput("\\134033\\012")).toBe("\\033\n");
+  });
+});
 
 describe("tmuxSessionName", () => {
   it("prefixes the session id", () => {

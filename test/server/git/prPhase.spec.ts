@@ -8,6 +8,7 @@ const pr = (over: Partial<ParsedPr> = {}): ParsedPr => ({
   isDraft: false,
   reviewDecision: "",
   ci: "passing",
+  mergeable: "MERGEABLE",
   url: null,
   number: null,
   body: "",
@@ -16,6 +17,27 @@ const pr = (over: Partial<ParsedPr> = {}): ParsedPr => ({
 });
 
 describe("derivePrPhase", () => {
+  // 競合は CI 失敗より前。枝を rebase しない限り何も進まず、落ちた checks は既に無い木に
+  // 対して走った結果なので、そこで "CI fail" を出すと log へ送ってしまう。
+  it("reports a conflict ahead of a failing CI", () => {
+    expect(derivePrPhase(pr({ mergeable: "CONFLICTING", ci: "failing" }))).toBe("conflict");
+  });
+
+  // draft は競合より前のまま。まだ見せる前のものに「直せ」と言っても仕方がない。
+  it("keeps draft ahead of a conflict", () => {
+    expect(derivePrPhase(pr({ isDraft: true, mergeable: "CONFLICTING" }))).toBe("draft");
+  });
+
+  // GitHub が計算し終えるまでの値。ここを競合にすると、開いた直後の PR が必ず一度赤くなる。
+  it.each(["UNKNOWN", "", "MERGEABLE"])("does not call %o a conflict", (mergeable) => {
+    expect(derivePrPhase(pr({ mergeable }))).toBe("ready");
+  });
+
+  // merged / closed は mergeable が何であれ関係ない。
+  it("does not report a conflict on a closed request", () => {
+    expect(derivePrPhase(pr({ state: "CLOSED", mergeable: "CONFLICTING" }))).toBe("closed");
+  });
+
   it("returns none when there is no PR", () => {
     expect(derivePrPhase(null)).toBe("none");
   });
@@ -64,9 +86,11 @@ describe("derivePrPhase", () => {
 
 describe("parsePrList", () => {
   it("parses each PR and rolls up its CI", () => {
-    const stdout = JSON.stringify([{ state: "OPEN", isDraft: false, reviewDecision: "APPROVED", statusCheckRollup: [{ conclusion: "SUCCESS" }], url: "u1" }]);
+    const stdout = JSON.stringify([
+      { state: "OPEN", isDraft: false, reviewDecision: "APPROVED", statusCheckRollup: [{ conclusion: "SUCCESS" }], mergeable: "MERGEABLE", url: "u1" },
+    ]);
     expect(parsePrList(stdout)).toEqual([
-      { state: "OPEN", isDraft: false, reviewDecision: "APPROVED", ci: "passing", url: "u1", number: null, body: "", title: "" },
+      { state: "OPEN", isDraft: false, reviewDecision: "APPROVED", ci: "passing", mergeable: "MERGEABLE", url: "u1", number: null, body: "", title: "" },
     ]);
   });
 
@@ -89,7 +113,7 @@ describe("parsePrList", () => {
 
   it("defaults missing fields", () => {
     expect(parsePrList(JSON.stringify([{}]))).toEqual([
-      { state: "", isDraft: false, reviewDecision: "", ci: "none", url: null, number: null, body: "", title: "" },
+      { state: "", isDraft: false, reviewDecision: "", ci: "none", mergeable: "", url: null, number: null, body: "", title: "" },
     ]);
   });
 });

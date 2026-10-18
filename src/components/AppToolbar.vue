@@ -3,7 +3,9 @@ import { computed, ref, useTemplateRef } from "vue";
 import { useRoute } from "vue-router";
 import { router } from "../router";
 import NotificationBell from "./NotificationBell.vue";
+import { TOOLBAR_LINK_FALLBACK_ICON } from "../../common/toolbarLinks";
 import RateLimitGauge from "./RateLimitGauge.vue";
+import SystemResourceGauge from "./SystemResourceGauge.vue";
 import RemoteHostControl from "./RemoteHostControl.vue";
 import LauncherButton from "./LauncherButton.vue";
 import { CONTENT_ROUTES } from "../composables/overlayOrigin";
@@ -16,6 +18,7 @@ import { useSoundEnabled } from "../composables/useSoundEnabled";
 import { audioBlocked } from "../composables/audioUnlockState";
 import { soundButtonState } from "./soundButtonState";
 import { useUpdateStatus } from "../composables/useUpdateStatus";
+import { useAppConfig } from "../composables/useAppConfig";
 import { useGithubStar } from "../composables/useGithubStar";
 import { useDropdownMenu } from "../composables/useDropdownMenu";
 import { parseTagQuery } from "./wikiTagFilter";
@@ -37,8 +40,21 @@ const props = defineProps<{
   // Grid zoom state, so the header can host the roster / strip toggle (shown only while zoomed).
   showViewToggle?: boolean;
   listMode?: boolean;
+  // The narrow layout (src/composables/phoneLayout.ts). Twelve controls and three gauges do not
+  // fit on a 390px row — measured, and what they do instead is render as an unreadable smear —
+  // so all but the four that matter move behind a disclosure.
+  phone?: boolean;
 }>();
 const emit = defineEmits<{ (e: "add-terminal" | "toggle-sort" | "toggle-view" | "settings"): void }>();
+
+// Which three survive on a phone, and why these: `add` is the reason to open the app at all, the
+// bell is what brought you to it, and Settings is the door people look for when something is
+// wrong. Everything else is reachable in one more tap. (There is no `back`: the header is not
+// drawn on the detail screen at all — see GridView.)
+const phoneMenuOpen = ref(false);
+const togglePhoneMenu = () => (phoneMenuOpen.value = !phoneMenuOpen.value);
+// On the desktop there is no disclosure, so "is the secondary row showing" is simply yes.
+const secondaryVisible = computed(() => props.phone !== true || phoneMenuOpen.value);
 const sortButton = computed(() => sortModeButton(props.sortMode ?? "manual"));
 
 const route = useRoute();
@@ -54,6 +70,8 @@ const { isOpen: prsOpen } = usePrsView();
 const { enabled: soundEnabled, toggle: toggleSound } = useSoundEnabled();
 const soundButton = computed(() => soundButtonState(soundEnabled.value, audioBlocked.value));
 const { badge: updateBadge } = useUpdateStatus();
+// 設定で名指しされた、ベルの左に並ぶリンク。読むだけ (useAppConfig 側に setter は無い)。
+const { toolbarLinks } = useAppConfig();
 const { visible: starVisible, confirming: starConfirming, title: starTitle, activate: activateStar } = useGithubStar();
 
 // Clicking the badge opens a popover that spells out what to run — a silent clipboard copy
@@ -133,9 +151,39 @@ function showPrs(): void {
 </script>
 
 <template>
-  <header class="flex h-10 flex-none items-center border-b border-border bg-panel px-4">
+  <header class="flex flex-none items-center border-b border-border bg-panel" :class="phone ? 'min-h-11 flex-wrap gap-y-1 px-2 py-1' : 'h-10 px-4'">
     <span class="font-sans text-[14px] font-semibold tracking-[0.02em] text-fg">MulmoTerminal</span>
-    <nav class="ml-4 flex min-w-0 items-center gap-[3px] overflow-x-auto" aria-label="Views">
+    <!-- Phone: the two controls that earn their place beside the title, then the disclosure.
+         `add` is here rather than in the nav below so starting something never costs two taps;
+         the nav's own copy is hidden on a phone so it is not offered twice. -->
+    <template v-if="phone">
+      <span class="ml-auto flex flex-none items-center gap-[3px]">
+        <LauncherButton
+          v-if="onGridRoute"
+          icon="add"
+          :title="addTerminalActive ? 'Cancel adding a terminal' : 'New terminal'"
+          label="New terminal"
+          :active="addTerminalActive"
+          @click="emit('add-terminal')"
+        />
+        <NotificationBell />
+        <LauncherButton
+          icon="more_horiz"
+          :title="phoneMenuOpen ? 'Hide the rest of the toolbar' : 'Show the rest of the toolbar'"
+          :label="phoneMenuOpen ? 'Hide the rest of the toolbar' : 'Show the rest of the toolbar'"
+          :active="phoneMenuOpen"
+          :aria-pressed="phoneMenuOpen"
+          @click="togglePhoneMenu"
+        />
+        <LauncherButton icon="settings" title="Settings" label="Settings" @click="emit('settings')" />
+      </span>
+    </template>
+    <nav
+      v-if="secondaryVisible"
+      class="flex min-w-0 items-center gap-[3px]"
+      :class="phone ? 'order-last w-full flex-wrap' : 'ml-4 overflow-x-auto'"
+      aria-label="Views"
+    >
       <!-- Both views: the pair that switches between them. Fenced off with a rule because it is
            the only group here that changes WHICH VIEW you are in — everything to its right acts
            within the current one, and a flat row of equal buttons hid that (#941). Same rule
@@ -173,6 +221,7 @@ function showPrs(): void {
           @click="showWorklog"
         />
         <LauncherButton
+          v-if="!phone"
           icon="add"
           :title="addTerminalActive ? 'Cancel adding a terminal' : 'New terminal (overflows to a new tab when full)'"
           label="New terminal"
@@ -202,63 +251,89 @@ function showPrs(): void {
         </span>
       </span>
       <RateLimitGauge v-if="onGridRoute" />
+      <SystemResourceGauge v-if="onGridRoute" />
     </nav>
-    <NotificationBell class="ml-auto" />
-    <RemoteHostControl />
-    <div v-if="updateBadge" ref="updateRoot" class="relative mr-1 flex-none">
-      <button
-        type="button"
-        class="inline-flex items-center gap-1 rounded-full border border-accent px-2 py-0.5 text-[12px] leading-none text-accent hover:bg-selected"
-        :class="{ 'bg-selected': updateOpen }"
-        :title="updateBadge.text"
-        :aria-label="updateBadge.text"
-        :aria-expanded="updateOpen"
-        aria-haspopup="true"
-        @click="toggleUpdate"
-      >
-        <span class="material-symbols-outlined text-[15px] leading-none" aria-hidden="true">upgrade</span>
-        Update
-      </button>
-      <div
-        v-if="updateOpen"
-        class="absolute right-0 top-full z-50 mt-1 w-64 rounded-md border border-border bg-panel p-3 text-[13px] text-fg shadow-lg"
-        role="group"
-        aria-label="Update available"
-      >
-        <p class="mb-2 font-semibold">A newer version is available</p>
-        <template v-if="updateBadge.command">
-          <p class="mb-1 text-muted">Run this to update:</p>
-          <div class="flex items-center gap-2">
-            <code class="min-w-0 flex-1 overflow-x-auto rounded bg-selected px-2 py-1 font-mono text-[12px] whitespace-nowrap">{{ updateBadge.command }}</code>
-            <button type="button" class="flex-none rounded border border-border px-2 py-1 text-[12px] hover:bg-selected" @click="copyUpdateCommand">
-              {{ copied ? "Copied" : "Copy" }}
-            </button>
-          </div>
-        </template>
-        <p v-else class="text-muted">{{ updateBadge.text }}</p>
+    <!-- The right-hand cluster, one block. It is pushed right on the desktop and becomes a row of
+         its own on a phone, under the nav — where `ml-auto` would only shove it against the edge
+         of a line it already has to itself. Hidden with the nav behind the disclosure, and the two
+         members the phone promotes to the title row (the bell, Settings) drop out of it there
+         rather than being offered twice. -->
+    <span v-if="secondaryVisible" class="flex items-center" :class="phone ? 'order-last w-full flex-wrap gap-1' : 'ml-auto'">
+      <!-- Pinned links, immediately LEFT of the bell (config `toolbarLinks`). -->
+      <span v-if="toolbarLinks.length" class="flex flex-none items-center gap-1">
+        <a
+          v-for="link in toolbarLinks"
+          :key="link.url"
+          :href="link.url"
+          target="_blank"
+          rel="noopener noreferrer"
+          data-testid="toolbar-link"
+          class="inline-flex h-[30px] w-[30px] flex-none items-center justify-center rounded-md bg-transparent text-muted no-underline hover:bg-hover hover:text-fg"
+          :title="link.label"
+          :aria-label="link.label"
+        >
+          <span class="material-symbols-outlined text-[19px] leading-none" aria-hidden="true">{{ link.icon || TOOLBAR_LINK_FALLBACK_ICON }}</span>
+        </a>
+      </span>
+      <NotificationBell v-if="!phone" />
+      <RemoteHostControl />
+      <div v-if="updateBadge" ref="updateRoot" class="relative mr-1 flex-none">
+        <button
+          type="button"
+          class="inline-flex items-center gap-1 rounded-full border border-accent px-2 py-0.5 text-[12px] leading-none text-accent hover:bg-selected"
+          :class="{ 'bg-selected': updateOpen }"
+          :title="updateBadge.text"
+          :aria-label="updateBadge.text"
+          :aria-expanded="updateOpen"
+          aria-haspopup="true"
+          @click="toggleUpdate"
+        >
+          <span class="material-symbols-outlined text-[15px] leading-none" aria-hidden="true">upgrade</span>
+          Update
+        </button>
+        <div
+          v-if="updateOpen"
+          class="absolute right-0 top-full z-50 mt-1 w-64 rounded-md border border-border bg-panel p-3 text-[13px] text-fg shadow-lg"
+          role="group"
+          aria-label="Update available"
+        >
+          <p class="mb-2 font-semibold">A newer version is available</p>
+          <template v-if="updateBadge.command">
+            <p class="mb-1 text-muted">Run this to update:</p>
+            <div class="flex items-center gap-2">
+              <code class="min-w-0 flex-1 overflow-x-auto rounded bg-selected px-2 py-1 font-mono text-[12px] whitespace-nowrap">{{
+                updateBadge.command
+              }}</code>
+              <button type="button" class="flex-none rounded border border-border px-2 py-1 text-[12px] hover:bg-selected" @click="copyUpdateCommand">
+                {{ copied ? "Copied" : "Copy" }}
+              </button>
+            </div>
+          </template>
+          <p v-else class="text-muted">{{ updateBadge.text }}</p>
+        </div>
       </div>
-    </div>
-    <!-- Grid only: star this project on GitHub. It retires itself once starred (or once the
+      <!-- Grid only: star this project on GitHub. It retires itself once starred (or once the
          user has opened the repo page), so it is a one-time ask rather than a fixture. -->
-    <LauncherButton v-if="starVisible" icon="star" :title="starTitle" :label="starTitle" :active="starConfirming" @click="activateStar" />
-    <LauncherButton
-      :icon="soundButton.icon"
-      :title="soundButton.label"
-      :label="soundButton.label"
-      :active="soundButton.active"
-      :tone="soundButton.tone"
-      :aria-pressed="soundEnabled"
-      @click="toggleSound"
-    />
-    <!-- Zoomed-grid only: switch the expanded terminal's side panel between the cockpit roster and
+      <LauncherButton v-if="starVisible" icon="star" :title="starTitle" :label="starTitle" :active="starConfirming" @click="activateStar" />
+      <LauncherButton
+        :icon="soundButton.icon"
+        :title="soundButton.label"
+        :label="soundButton.label"
+        :active="soundButton.active"
+        :tone="soundButton.tone"
+        :aria-pressed="soundEnabled"
+        @click="toggleSound"
+      />
+      <!-- Zoomed-grid only: switch the expanded terminal's side panel between the cockpit roster and
          the thumbnail strip. Sits at the right end (next to Settings) and hides when nothing is expanded. -->
-    <LauncherButton
-      v-if="showViewToggle"
-      :icon="listMode ? 'view_carousel' : 'view_agenda'"
-      :title="listMode ? 'Show thumbnail strip' : 'Show list roster'"
-      :label="listMode ? 'Show thumbnail strip' : 'Show list roster'"
-      @click="emit('toggle-view')"
-    />
-    <LauncherButton icon="settings" title="Settings" label="Settings" @click="emit('settings')" />
+      <LauncherButton
+        v-if="showViewToggle"
+        :icon="listMode ? 'view_carousel' : 'view_agenda'"
+        :title="listMode ? 'Show thumbnail strip' : 'Show list roster'"
+        :label="listMode ? 'Show thumbnail strip' : 'Show list roster'"
+        @click="emit('toggle-view')"
+      />
+      <LauncherButton v-if="!phone" icon="settings" title="Settings" label="Settings" @click="emit('settings')" />
+    </span>
   </header>
 </template>

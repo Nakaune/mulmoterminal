@@ -65,6 +65,29 @@ export function turnBoundaries(lines: string[]): CodexTurnBoundary[] {
   });
 }
 
+/** Extract explicit workdirs from exec custom tool calls in rollout response items. */
+export function explicitWorkdirs(lines: string[]): string[] {
+  return lines.flatMap((line) => {
+    try {
+      const doc: unknown = JSON.parse(line);
+      if (!isRecord(doc) || doc.type !== "response_item" || !isRecord(doc.payload)) return [];
+      if (doc.payload.type !== "custom_tool_call" || doc.payload.name !== "exec") return [];
+      if (isRecord(doc.payload.input) && typeof doc.payload.input.workdir === "string") return doc.payload.input.workdir ? [doc.payload.input.workdir] : [];
+      if (typeof doc.payload.input !== "string") return [];
+      const result: string[] = [];
+      for (const call of doc.payload.input.matchAll(/tools\.exec_command\s*\(\s*\{([\s\S]*?)\}\s*\)/g)) {
+        const body = call[1];
+        if (body === undefined) continue;
+        const value = /(?:"workdir"|workdir)\s*:\s*"([^"]*)"/.exec(body)?.[1];
+        if (value) result.push(value);
+      }
+      return result;
+    } catch {
+      return [];
+    }
+  });
+}
+
 // What a boundary does: the flag changes, and whether the phone should hear about it.
 // Both come from claude's tables so the two agents cannot drift apart — a codex turn that
 // finishes has to notify exactly as a claude Stop does, or half the grid stays silent.

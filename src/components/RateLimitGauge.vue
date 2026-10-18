@@ -28,6 +28,16 @@ const view = computed(() => {
 const gauges = computed(() => view.value.gauges);
 const probeNote = computed(() => view.value.note);
 const titleFor = (agent: "claude" | "codex") => gaugeTitle(agent, snapshot.value?.[agent] ?? null, view.value.now_ms);
+const AGENT_COLORS = { claude: "#d97757", codex: "#10a37f" } as const;
+const MIN_COLOR_PERCENT = 25;
+const concise = (value: number): string => Number(value.toFixed(2)).toString();
+const usageColor = (agent: "claude" | "codex", usedPercent: number): string => {
+  const bounded = Math.min(100, Math.max(0, Math.round(usedPercent)));
+  const colorPercent = MIN_COLOR_PERCENT + bounded * ((100 - MIN_COLOR_PERCENT) / 100);
+  return `color-mix(in srgb, var(--text-muted) ${concise(100 - colorPercent)}%, ${AGENT_COLORS[agent]} ${concise(colorPercent)}%)`;
+};
+const colorStyle = (agent: "claude" | "codex", usedPercent: number) => ({ color: usageColor(agent, usedPercent) });
+const highestPercent = (windows: { percent: number }[]): number => Math.max(...windows.map((window) => window.percent));
 </script>
 
 <template>
@@ -49,13 +59,15 @@ const titleFor = (agent: "claude" | "codex") => gaugeTitle(agent, snapshot.value
     role="img"
     :aria-label="titleFor(gauge.agent)"
     :title="titleFor(gauge.agent)"
+    data-local-feature="rate-limit-usage-color"
   >
-    <AgentMark v-if="gauge.marked" :agent="gauge.agent" :class="gauge.windows.some((w) => w.warn) ? 'text-amber' : 'text-muted'" />
+    <AgentMark v-if="gauge.marked" :agent="gauge.agent" :style="colorStyle(gauge.agent, highestPercent(gauge.windows))" />
     <span
       v-for="window in gauge.windows"
       :key="window.label"
       class="font-mono text-[12px] leading-none"
-      :class="window.warn ? 'text-amber' : 'text-muted'"
+      :style="colorStyle(gauge.agent, window.percent)"
+      :data-testid="`rate-limit-${gauge.agent}-${window.label}`"
       aria-hidden="true"
       >{{ window.label }} {{ window.percent }}%</span
     >

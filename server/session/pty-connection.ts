@@ -9,6 +9,7 @@ import type { IPty } from "node-pty";
 import type { WebSocket } from "ws";
 import { messageOf } from "../errors.js";
 import { isResizeFrame } from "./ws-frames.js";
+import { isConnectionDrop } from "./reap-policy.js";
 import { isRecord } from "../../common/isRecord.js";
 import { stripTerminalQueries, terminalModePrefix } from "./terminal-replay.js";
 import type { PtyEntry } from "./types.js";
@@ -91,6 +92,7 @@ export function createConnectionHandlers(deps: ConnectionDeps) {
   // the new one, and replay the buffered tail for context.
   function reattachPty(entry: PtyEntry, ws: WebSocket, sessionId: string): PtyEntry {
     deps.cancelReap(sessionId); // a reattach within the grace window keeps the session
+    entry.connectionDropped = false; // whatever broke last time, someone is holding this session again
     console.log(`[ws] reattach ${sessionId} (pid=${entry.term.pid})`);
     // Drop any socket still attached (e.g. the same session open in another tab).
     // Tell it it's been superseded FIRST so it stops instead of auto-reconnecting —
@@ -158,11 +160,18 @@ export function createConnectionHandlers(deps: ConnectionDeps) {
   }
 
   // Socket closed: detach it and decide the PTY's fate by activity — working stays
-  // alive, needs-the-user gets a long grace, idle gets the short grace.
-  function handleClientClose(entry: PtyEntry, ws: WebSocket, sessionId: string) {
+  // alive, needs-the-user gets a long grace, idle gets the short grace. Unless the socket
+  // BROKE, in which case none of those apply (see below).
+  function handleClientClose(entry: PtyEntry, ws: WebSocket, sessionId: string, closeCode?: number) {
     // Ignore if a newer client already reattached to this session.
     if (entry.ws !== ws) return;
     entry.ws = null;
+    // Why it went away decides whether reaping is right at all. A close the client ASKED for
+    // says the user is done with this session; a connection that broke says only that they
+    // cannot reach it. Over loopback the two are the same in practice — the socket outlives
+    // everything short of the server — but a browser on another machine loses it whenever the
+    // network does, and grace-reaping then kills an agent mid-conversation for a wifi blink.
+    entry.connectionDropped = isConnectionDrop(closeCode);
     deps.cancelTerminalSizeCheck(sessionId);
     // A session with no live socket is by definition not being viewed. Clear `active`
     // so an UNCLEAN disconnect (crash / network drop / killed tab, where the client

@@ -1,0 +1,7 @@
+[Unit]
+Description=Verify and back up the selected MulmoTerminal release
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=%h/.local/bin/mulmoterm backup %h/src/mulmoterminal-4.6-local

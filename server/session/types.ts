@@ -32,9 +32,18 @@ export interface PtyEntry {
   // (see tmuxRedrawClient). Cleared by the first resize frame after the reattach — waiting for it
   // is the point, since that frame is where the client tells us the size it actually settled at.
   redrawPending?: boolean;
+  // The last socket on this session broke rather than closed (ABNORMAL_CLOSURE). Kept on
+  // the entry, not passed along the close call, because the reap is re-armed later too —
+  // every activity-flag change re-arms it — and by then the close code is long gone.
+  // Set on close, cleared on reattach.
+  connectionDropped?: boolean;
   // What is running in this PTY. Recorded at spawn because nothing else can recover it
   // later, and the phone needs it to offer input that suits the session (mulmoserver#84).
   agent: SessionAgent;
+  /** Latest Codex TUI OSC state; undefined until its first supported marker. */
+  codexTerminalState?: "working" | "idle";
+  /** Set by rollout identity binding when a durable rollout identity is established. */
+  codexRolloutBound?: boolean;
 }
 
 export interface KnownSession {

@@ -8,6 +8,7 @@ export interface CellChromeSource {
   filesOpen?: boolean | undefined;
   rightPane?: RightPane | null | undefined;
   canvasAvailable?: boolean | undefined;
+  phone?: boolean | undefined;
 }
 
 // The two booleans are resolved rather than passed through as `boolean | undefined`: under
@@ -19,6 +20,7 @@ export interface CellChromeProps {
   filesOpen: boolean;
   rightPane: RightPane | null;
   canvasAvailable: boolean;
+  phone: boolean;
 }
 
 export type CellChromeEvent = "toggle-expand" | "toggle-files" | "toggle-canvas" | "toggle-tools" | "close";
@@ -43,6 +45,7 @@ export function cellChromeBinding(
       filesOpen: source.filesOpen ?? false,
       rightPane: source.rightPane ?? null,
       canvasAvailable: source.canvasAvailable ?? false,
+      phone: source.phone ?? false,
     })),
     chromeEvents: {
       "toggle-expand": () => emit("toggle-expand"),

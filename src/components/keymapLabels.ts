@@ -10,6 +10,7 @@ const LABELS: Record<KeymapAction, string> = {
   "zoom-next": "Enlarge the next terminal",
   "zoom-prev": "Enlarge the previous terminal",
   "next-attention": "Jump to a terminal that needs you",
+  "review-toggle": "Mark / clear this terminal for review",
   "terminal-new": "New terminal (at the end)",
   "terminal-new-adjacent": "New terminal next to this one",
   "terminal-close": "Close this terminal",

@@ -5,6 +5,7 @@ import TerminalGrid, { type CockpitRow } from "../../../src/components/TerminalG
 import type { Cell } from "../../../src/components/gridTabs.js";
 import type { RunCommand } from "../../../src/components/runCommand.js";
 import { setCockpitLines } from "../../../src/composables/cockpitLines";
+import { useRosterAlert } from "../../../src/composables/useRosterAlert";
 
 // Stub the cells so the page renderer can be tested without Terminal/xterm/pub-sub.
 // The host drives the pane through reload()/confirmDiscard(); spies here are what let the
@@ -91,15 +92,44 @@ const rosterRow = (uid: number, over: Partial<CockpitRow> = {}): CockpitRow => (
   response: null,
   fallback: null,
   phase: "none",
+  pr: null,
+  prUrl: null,
   workPhase: null,
   headerColor: null,
   headerTextColor: null,
   iconUrl: null,
   parked: false,
+  reviewPending: false,
   ...over,
 });
-const mountCockpit = (cells: Cell[], expandedUid: number, listRows: CockpitRow[], reorderable = false, listMode = true) =>
+// `stubs` because a component that renders NOTHING has no element, and findComponent walks the
+// DOM — the requests chip draws nothing until its session has touched a request, so the only way
+// to see what it was handed is to stub it into an element of its own.
+// The phone layout, which the desktop helpers cannot express: it is the only one that shows the
+// roster with NOTHING zoomed, so `expandedUid` has to be allowed to be null here.
+const mountPhone = (cells: Cell[], expandedUid: number | null, listRows: CockpitRow[], stubs: Record<string, boolean> = { RosterPrsChip: true }) =>
   mount(TerminalGrid, {
+    global: { stubs },
+    props: {
+      cells,
+      expandedUid,
+      listRows,
+      cancelUid: null,
+      defaultCwd: "/work",
+      presets: [],
+      launchers: [],
+      home: "/work",
+      openSessionIds: [],
+      openCwds: [],
+      reorderable: false,
+      listMode: true,
+      phone: true,
+    },
+  });
+
+const mountCockpit = (cells: Cell[], expandedUid: number, listRows: CockpitRow[], reorderable = false, listMode = true, stubs: Record<string, boolean> = {}) =>
+  mount(TerminalGrid, {
+    global: { stubs },
     props: {
       cells,
       expandedUid,
@@ -130,11 +160,11 @@ describe("TerminalGrid (page renderer)", () => {
 
   it("re-emits each cell event tagged with the cell uid", () => {
     const w = mountGrid([cell(7, "s")]);
-    cellsOf(w)[0].vm.$emit("session", "new");
+    cellsOf(w)[0].vm.$emit("session", "new", "s");
     cellsOf(w)[0].vm.$emit("cwd", "/x");
     cellsOf(w)[0].vm.$emit("close");
     cellsOf(w)[0].vm.$emit("toggle-expand");
-    expect(w.emitted("session")?.[0]).toEqual([7, "new"]);
+    expect(w.emitted("session")?.[0]).toEqual([7, "new", "s"]); // the id attached for rides along
     expect(w.emitted("cwd")?.[0]).toEqual([7, "/x"]);
     expect(w.emitted("close")?.[0]).toEqual([7]);
     expect(w.emitted("toggle-expand")?.[0]).toEqual([7]);
@@ -267,6 +297,23 @@ describe("active-cell focus zoom", () => {
 });
 
 describe("grid cockpit (list view)", () => {
+  it("shows the branch PR in a minimized roster row and keeps link clicks from expanding it", async () => {
+    const w = mountCockpit(
+      [cell(0, "s0"), cell(1, "s1")],
+      0,
+      [rosterRow(0), rosterRow(1, { pr: 1447, prUrl: "https://github.com/acme/repo/pull/1447", phase: "merged" })],
+      false,
+      true,
+      { RosterPrsChip: true },
+    );
+    await nextTick();
+    const link = w.get('[data-testid="cockpit-row"][data-uid="1"] [data-testid="cockpit-pr"]');
+    expect(link.text()).toBe("#1447");
+    expect(link.attributes("href")).toContain("/1447");
+    await link.trigger("click");
+    expect(w.emitted("toggle-expand")).toBeUndefined();
+  });
+
   it("shows the roster in list mode and the thumbnail strip otherwise (driven by the listMode prop)", async () => {
     const w = mountCockpit([cell(0, "s0"), cell(1, "s1")], 0, [rosterRow(0), rosterRow(1)]);
     await nextTick();
@@ -307,11 +354,62 @@ describe("grid cockpit (list view)", () => {
     const rows = w.findAll('[data-testid="cockpit-row"]');
     expect(rows[0].classes()).toContain("border-l-[#4a9eff]");
     expect(rows[0].classes()).not.toContain("animate-roster-alert");
-    expect(rows[1].classes()).toContain("animate-roster-alert");
+    // The colour is the mark; the MOTION is opt-in and off by default (useRosterAlert), so a
+    // waiting row is amber and still until someone asks for movement.
     expect(rows[1].classes()).toContain("border-l-[#f59e0b]");
+    expect(rows[1].classes()).not.toContain("animate-roster-alert");
     // The weak half of the split: finished is coloured, but it does not move.
     expect(rows[2].classes()).toContain("border-l-done");
     expect(rows[2].classes()).not.toContain("animate-roster-alert");
+  });
+
+  // The chip is on the ROW, not only in the expanded cell's header: the list is where "which
+  // session touched which request" is read without opening anything. Each row asks for its own
+  // session, so the id it is handed is what decides whether it asks about the right one.
+  it("gives each roster row its own session for the requests chip", async () => {
+    const w = mountCockpit([cell(0, "s0"), cell(1, "s1")], 0, [rosterRow(0), rosterRow(1)], false, true, { RosterPrsChip: true });
+    await nextTick();
+    const chips = w.findAllComponents({ name: "RosterPrsChip" });
+    expect(chips.map((c) => c.props("sessionId"))).toEqual(["s0", "s1"]);
+  });
+
+  // 2 行目 — ヘッダの下、memo より上。ヘッダの中に置くと、同じ行の path がチップのぶんだけ
+  // 削られる。順序そのものが仕様なので、存在ではなく前後関係を押さえる。
+  it("puts the chip on its own line under the header, above the memo", async () => {
+    const w = mountCockpit([cell(0, "s0")], 0, [rosterRow(0, { memo: "note" })], false, true, { RosterPrsChip: true });
+    await nextTick();
+    const html = w.html();
+    const dir = html.indexOf('data-testid="cockpit-dir"');
+    const chip = html.indexOf("roster-prs-chip-stub");
+    const memo = html.indexOf('data-testid="cockpit-memo"');
+    expect(dir).toBeGreaterThan(-1);
+    expect(chip).toBeGreaterThan(dir);
+    expect(memo).toBeGreaterThan(chip);
+  });
+
+  // A launcher or a cell still starting has no session to ask about, and the chip must be given
+  // null rather than a stale neighbour's id.
+  it("hands null for a row whose cell has no session yet", async () => {
+    const w = mountCockpit([{ uid: 0, session: null, cwd: "/work" }], 0, [rosterRow(0)], false, true, { RosterPrsChip: true });
+    await nextTick();
+    expect(w.findComponent({ name: "RosterPrsChip" }).props("sessionId")).toBeNull();
+  });
+
+  // Its own case because the one above cannot see this class at all now that the default is off,
+  // and a class nothing asserts is a class that can vanish in silence. The composable's state is
+  // module-level and shared, so it is put back before the next case reads it.
+  it("blinks the waiting row once the setting is on", async () => {
+    const { setBlink } = useRosterAlert();
+    setBlink(true);
+    try {
+      const w = mountCockpit([cell(0, "s0"), cell(1, "s1")], 0, [rosterRow(0), rosterRow(1, { status: "blocked" })]);
+      await nextTick();
+      const rows = w.findAll('[data-testid="cockpit-row"]');
+      expect(rows[1].classes()).toContain("animate-roster-alert");
+      expect(rows[1].classes()).toContain("border-l-[#f59e0b]");
+    } finally {
+      setBlink(false);
+    }
   });
 
   it("emits toggle-expand when a NON-active row is clicked, and not for the active one", async () => {
@@ -973,5 +1071,59 @@ describe("open-in-canvas", () => {
     const enlarged = w.findAllComponents({ name: "TerminalCell" }).find((c) => c.props("expanded"));
     expect(enlarged?.props("initialSessionId")).toBe("s-two");
     expect(enlarged?.props("canvasAvailable")).toBe(false);
+  });
+});
+
+// The fourth layout (src/composables/phoneLayout.ts). What makes it a layout rather than a set of
+// smaller paddings is that the roster and the terminal stop being neighbours and become PLACES:
+// exactly one of them is on screen, and which one is decided by whether anything is zoomed.
+describe("TerminalGrid (phone)", () => {
+  it("shows the roster as the whole screen while nothing is zoomed", () => {
+    const w = mountPhone([cell(0, "s0"), cell(1, "s1")], null, [rosterRow(0), rosterRow(1)]);
+    expect(w.findAll('[data-testid="cockpit-row"]')).toHaveLength(2);
+    // No lane of its own: on the desktop the roster is sized by the splitter drag, and applying
+    // that width here would leave the list in a column with the rest of the window empty.
+    expect(w.get('[data-testid="cockpit"]').attributes("style")).toBeUndefined();
+  });
+
+  // `zoomed` needs a tick (it is gated on `mounted`, so xterm is never measured before there is
+  // a box), which is why these await where the un-zoomed cases above do not.
+  it("gives the whole screen to the terminal once something is zoomed", async () => {
+    const w = mountPhone([cell(0, "s0"), cell(1, "s1")], 0, [rosterRow(0), rosterRow(1)]);
+    await nextTick();
+    expect(w.find('[data-testid="cockpit"]').exists()).toBe(false);
+  });
+
+  // Both splitters drag one pane against another, and a phone never has two.
+  it("draws neither splitter", async () => {
+    const zoomed = mountPhone([cell(0, "s0")], 0, [rosterRow(0)]);
+    await nextTick();
+    expect(zoomed.find('[data-testid="roster-splitter"]').exists()).toBe(false);
+    expect(zoomed.find('[data-testid="strip-splitter"]').exists()).toBe(false);
+  });
+
+  // #1125, carried into the state the desktop never has: the cells stay MOUNTED behind the list —
+  // their connections are live and the roster is a view of them — and the `phone` class is what
+  // parks them off-screen at a real size instead of laying them out at the phone's width.
+  it("keeps the cells mounted while the roster is the screen", () => {
+    const w = mountPhone([cell(0, "s0"), cell(1, "s1")], null, [rosterRow(0), rosterRow(1)]);
+    expect(cellsOf(w)).toHaveLength(2);
+    expect(w.get(".stage").classes()).toContain("phone");
+  });
+
+  // The row is hit with a thumb here, not pointed at.
+  it("gives the roster rows a taller tap target", async () => {
+    const phone = mountPhone([cell(0, "s0")], null, [rosterRow(0)]);
+    const desk = mountCockpit([cell(0, "s0")], 0, [rosterRow(0)], false, true, { RosterPrsChip: true });
+    await nextTick();
+    expect(phone.get('[data-testid="cockpit-row"]').classes()).toContain("py-3");
+    expect(desk.get('[data-testid="cockpit-row"]').classes()).toContain("py-2");
+  });
+
+  // Tapping a row is the whole navigation: it is what turns the list screen into the detail one.
+  it("asks for a cell to be enlarged when its row is tapped", async () => {
+    const w = mountPhone([cell(0, "s0"), cell(1, "s1")], null, [rosterRow(0), rosterRow(1)]);
+    await w.findAll('[data-testid="cockpit-row"]')[1].trigger("click");
+    expect(w.emitted("toggle-expand")?.[0]).toEqual([1]);
   });
 });

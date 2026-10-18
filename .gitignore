@@ -33,3 +33,8 @@ dist-ssr
 # Run-menu scripts, which are one machine's commands.
 .mulmoterminal.local.json
 script.json
+
+# `npm pack` の出力。配備は tgz を ~/.local/share/mulmoterminal-local/ へ名前を付けて
+# 置く運用 (mt-tools の README) で、repo 直下に落ちるこれは中間物にすぎない。8MB 超あり、
+# `git add -A` で黙って入るのを防ぐ。
+/mulmoterminal-*.tgz

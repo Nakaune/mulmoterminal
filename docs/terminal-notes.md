@@ -98,7 +98,7 @@ same question.
 
 | Kind | Where | Recognizes |
 |---|---|---|
-| Local file path (#778) | `terminalFilePathLinkProvider.ts` (`registerLinkProvider`) | a token with a `/` and a file extension, scoped to the session cwd → the **Files pane** beside an enlarged cell when it can show that kind and the path is under that cell's dir (#910), else **routed by extension** (#808–#811): rendered/indented/table routes, the in-app Files view, or `/api/files/raw` as the fallback |
+| Local file path (#778) | `terminalFilePathLinkProvider.ts` (`registerLinkProvider`) | a token with a `/` and a file extension → **revealed in the OS file manager** via `POST /api/open-dir` (local fork; upstream routes it by extension into the in-app viewers, scoped to the session cwd). Relative paths resolve against the session cwd server-side; absolute paths outside it are allowed. When the page is not served from `localhost` (`remoteFileOpen.ts`) the click takes upstream's in-app routing instead, with a serving base chosen to contain the path: the clicking session's cwd, another live session's cwd, else the file's own folder |
 | OSC 8 hyperlink (#783/#785) | `linkHandler` + xterm core `OscLinkService` | arbitrary text → URL (Claude statusline `PR #NNNN`) — **requires the tmux `hyperlinks` feature** |
 | Plain URL | `WebLinksAddon` | visible `http(s)://` URLs |
 

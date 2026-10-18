@@ -30,6 +30,7 @@ import { reactive, watch } from "vue";
 import { Terminal, type ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
+import { alignLoopbackHost } from "../utils/loopbackLink";
 import { ClipboardAddon, type IClipboardProvider } from "@xterm/addon-clipboard";
 import { guardMouseClicks, guardMouseTracking } from "./terminalMouseInput";
 import { getTerminalScrollSpeed } from "./useTerminalScrollSpeed";
@@ -59,8 +60,7 @@ import { sendBytesFor, type Keymap, type KeymapKeyEvent } from "../../common/key
 import { getActiveKeymap } from "./activeKeymap";
 import { isCopyOnSelectEnabled } from "./copyOnSelect";
 import { createFilePathLinkProvider } from "./terminalFilePathLinkProvider";
-import { tryOpenInPane } from "./filesPaneOpener";
-import { filesGotoFile } from "./useFilesView";
+import { openClickedFilePath } from "./clickedFilePath";
 import type { TerminalAgent } from "../../common/sessionAgent";
 
 export type ConnStatus = "connecting" | "connected" | "disconnected";
@@ -151,6 +151,7 @@ const submittableFor = (c: Conn, text: string): string => (isClaudeTarget(c.targ
 export interface ConnHandlers {
   onSession?: (id: string) => void;
   onCwd?: (cwd: string) => void;
+  onLiveCwd?: (cwd: string) => void;
   // `exitCode` is the command's status when the server reported one, else null (a start
   // failure, or an agent session that ended without one). A Run cell reads it to tell a
   // clean finish from a broken build.
@@ -167,6 +168,9 @@ export interface ConnHandlers {
   // that ended and for a Run cell, neither of which comes back — telling those to wait would be a
   // promise nothing will keep.
   onInputDropped?: (willReconnect: boolean) => void;
+  // Something this connection did on the user's behalf failed in a way only they can act on —
+  // today, a clicked file path the OS file manager would not open. Shown in the cell's banner.
+  onNotice?: (message: string) => void;
 }
 
 // The two xterm options that decide the CELL METRICS, so they travel together: both change how
@@ -190,6 +194,7 @@ interface Conn {
   ws: WebSocket | null;
   knownSessionId: string | null;
   knownCwd: string | null; // server-resolved cwd, replayed on (re)attach
+  liveCwd: string | null;
   target: ConnTarget;
   handlers: ConnHandlers;
   sawExit: boolean; // an intentional end (exit/superseded/error) — suppress reconnect
@@ -255,7 +260,7 @@ function fitAndSyncSize(c: Conn): void {
 
 // The reactive projection the view binds to (status pill, RunMenu cwd). Keyed by
 // the same slot key; a slot that hasn't connected yet (or was released) is absent.
-export const connView = reactive(new Map<string, { status: ConnStatus; serverCwd: string | null }>());
+export const connView = reactive(new Map<string, { status: ConnStatus; serverCwd: string | null; liveCwd: string | null }>());
 
 function setStatus(c: Conn, s: ConnStatus) {
   const v = connView.get(c.key);
@@ -372,6 +377,13 @@ function wireCopyOnSelect(term: Terminal, host: HTMLDivElement): void {
 // emit a `javascript:`/`file:` link that runs on click — the safeguard xterm's docs call for.
 export const isOpenableTerminalLink = (uri: string): boolean => /^https?:\/\//i.test(uri);
 
+// Every terminal link opens through here so the two paths (OSC 8 above, plain http(s) text via
+// WebLinksAddon) cannot drift apart — one of them silently keeping the unrewritten host is
+// exactly the shape that reads as "the fix works, except sometimes".
+export const openTerminalLink = (uri: string): void => {
+  window.open(alignLoopbackHost(uri, window.location.hostname), "_blank", "noopener,noreferrer");
+};
+
 // Keep a drag as a text selection: refuse the mouse-tracking modes an app would use to take it
 // over, so its coordinate reports never land in the agent's prompt (#729). Registered per
 // terminal and disposed with it.
@@ -442,20 +454,16 @@ function wireTerminalInput(term: Terminal, c: Conn): void {
   });
 }
 
-// Linkify file paths in the output, scoped to the session's live cwd (read lazily, since
-// it's learned after connect). The pane beside an enlarged cell gets first refusal, so a
-// click can land NEXT to the terminal it came from; failing that, a document or an image
-// opens in a new tab through the file routes, and source opens in the app's own Files view.
+// Linkify file paths in the output, scoped to the session's live cwd (read lazily, since it's
+// learned after connect). A click reveals the path in the OS file manager on the server's own
+// desktop and opens it in the app from anywhere else — see clickedFilePath.
 function registerFilePathLinks(term: Terminal, c: Conn): void {
-  term.registerLinkProvider(
-    createFilePathLinkProvider(
-      term,
-      () => c.knownCwd,
-      (url) => window.open(url, "_blank", "noopener,noreferrer"),
-      (filePath, cwd) => filesGotoFile(cwd, filePath),
-      (filePath, cwd) => tryOpenInPane(filePath, cwd),
-    ),
-  );
+  const context = {
+    sessionCwds: () => [...conns.values()].flatMap((conn) => conn.knownCwd ?? []),
+    onNotice: (message: string) => c.handlers.onNotice?.(message),
+  };
+  const open = (filePath: string, cwd: string): void => openClickedFilePath(filePath, cwd, context);
+  term.registerLinkProvider(createFilePathLinkProvider(term, () => c.knownCwd, open));
 }
 
 interface TerminalRuntime {
@@ -492,14 +500,14 @@ function buildTerminal(swallowedMouseModes: Set<number>, font: TerminalFont): Te
     // click — which reads as "the link is broken". Open http(s) targets in a new tab instead.
     linkHandler: {
       activate: (_event, uri) => {
-        if (isOpenableTerminalLink(uri)) window.open(uri, "_blank", "noopener,noreferrer");
+        if (isOpenableTerminalLink(uri)) openTerminalLink(uri);
       },
     },
   });
   guardMouseTracking(term, swallowedMouseModes);
   const fitAddon = new FitAddon();
   term.loadAddon(fitAddon);
-  term.loadAddon(new WebLinksAddon());
+  term.loadAddon(new WebLinksAddon((_event, uri) => openTerminalLink(uri)));
   // OSC 52 clipboard: Claude Code auto-copies the selection via OSC 52 — without this
   // addon xterm ignores it, so the copy silently never reaches the browser clipboard.
   term.loadAddon(new ClipboardAddon(undefined, clipboardProvider));
@@ -558,6 +566,7 @@ function ensure(key: string, target: ConnTarget, font: TerminalFont): Conn {
     ws: null,
     knownSessionId: target.sessionId,
     knownCwd: null,
+    liveCwd: null,
     target,
     handlers: {},
     sawExit: false,
@@ -573,7 +582,7 @@ function ensure(key: string, target: ConnTarget, font: TerminalFont): Conn {
     lastDroppedInputNoticeMs: Number.NEGATIVE_INFINITY,
   };
   conns.set(key, c);
-  connView.set(key, { status: "connecting", serverCwd: target.cwd });
+  connView.set(key, { status: "connecting", serverCwd: target.cwd, liveCwd: null });
   wireTerminalToConn(term, c);
   return c;
 }
@@ -644,7 +653,11 @@ function connect(c: Conn) {
   // Drop the previous session's resolved cwd so the Run menu can't list/launch the
   // prior project's scripts before the new `session` message arrives.
   const v = connView.get(c.key);
-  if (v) v.serverCwd = c.target.cwd;
+  if (v) {
+    v.serverCwd = c.target.cwd;
+    v.liveCwd = null;
+  }
+  c.liveCwd = null;
 
   // Resume the known id (server-learned, or the prop) so a reconnect re-attaches the
   // same session instead of spawning a fresh one each retry.
@@ -719,6 +732,13 @@ function handleMessage(c: Conn, event: MessageEvent) {
     if (typeof msg.data === "string") c.term.write(msg.data);
   } else if (msg.type === "session") {
     applySessionFrame(c, msg);
+  } else if (msg.type === "cwd") {
+    if (typeof msg.cwd === "string") {
+      c.liveCwd = msg.cwd;
+      const v = connView.get(c.key);
+      if (v) v.liveCwd = msg.cwd;
+      c.handlers.onLiveCwd?.(msg.cwd);
+    }
   } else {
     applyTerminalFrame(c, msg);
   }
@@ -728,6 +748,15 @@ function handleMessage(c: Conn, event: MessageEvent) {
 // otherwise reattach the persisted xterm to the new DOM host. Never reconnects an
 // already-live slot — that's the whole point (no cold resume on remount).
 export function attach(key: string, target: ConnTarget, handlers: ConnHandlers, el: HTMLElement, theme?: ITheme, font: TerminalFont = DEFAULT_FONT) {
+  // A slot key is `cell-<uid>`, and the shared grid (useSharedGridState) can hand a uid this
+  // browser once used to a DIFFERENT session — another browser renumbered or reused it. The slot
+  // left behind still holds the old session, and reusing it would replay that id below, so this
+  // browser would write the old session back over the cell another browser just launched (seen in
+  // grid-watch.log on 2026-10-15: uid 13 went 2f7d8fd3 -> f46060ac two seconds after "New
+  // terminal"). Both ids known and different means the slot belongs to another session: drop it.
+  // A null target is left alone — that is a cell whose id arrived while detached, replayed below.
+  const stale = conns.get(key);
+  if (stale?.knownSessionId && target.sessionId && stale.knownSessionId !== target.sessionId) release(key);
   const created = !conns.has(key);
   const c = ensure(key, target, font);
   c.released = false;
@@ -740,6 +769,7 @@ export function attach(key: string, target: ConnTarget, handlers: ConnHandlers, 
   // useful update; the parent's setters are idempotent for already-known values.
   if (c.knownSessionId) handlers.onSession?.(c.knownSessionId);
   if (c.knownCwd) handlers.onCwd?.(c.knownCwd);
+  if (c.liveCwd) handlers.onLiveCwd?.(c.liveCwd);
   el.appendChild(c.host);
   if (theme) {
     c.theme = theme;
@@ -818,6 +848,22 @@ export function release(key: string) {
   }
   conns.delete(key);
   connView.delete(key);
+}
+
+// This tab is going inert (superseded by a newer one): stop every slot from reconnecting, but leave
+// its socket OPEN. Closing it would detach the session, and an idle detached session is reaped after
+// the short grace unless the new tab happens to attach it in time — one it never shows (another
+// page, a phone showing a few cells) would be killed. An open socket keeps it alive until the new
+// tab attaches, and the server then moves the viewer over and sends this one "superseded". No
+// reconnect either way: a reconnect would take the viewer BACK from the tab now in use.
+export function freezeAll() {
+  for (const c of conns.values()) {
+    c.sawExit = true;
+    if (c.reconnectTimer) {
+      clearTimeout(c.reconnectTimer);
+      c.reconnectTimer = null;
+    }
+  }
 }
 
 // Explicit close (the cell's close button): tell the server to reap this session NOW instead

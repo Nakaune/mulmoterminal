@@ -102,4 +102,18 @@ describe("RateLimitGauge", () => {
     expect(wrapper.findComponent({ name: "AgentMark" }).props("agent")).toBe("codex");
     wrapper.unmount();
   });
+
+  it("uses distinct usage-strength colors for Claude and Codex", async () => {
+    const claude = { fiveHour: { usedPercentage: 80, resetsAt_sec: inHours(2) }, sevenDay: null };
+    const codex = { fiveHour: { usedPercentage: 20, resetsAt_sec: inHours(2) }, sevenDay: null };
+    const wrapper = await showGauge(body({ claude, codex, claudeProbe: "ok" }));
+    const claudeWindow = wrapper.get('[data-testid="rate-limit-claude-5h"]');
+    const codexWindow = wrapper.get('[data-testid="rate-limit-codex-5h"]');
+
+    expect(claudeWindow.attributes("style")).toContain("#d97757");
+    expect(codexWindow.attributes("style")).toContain("#10a37f");
+    expect(claudeWindow.attributes("style")).not.toBe(codexWindow.attributes("style"));
+    expect(wrapper.findAll('[data-local-feature="rate-limit-usage-color"]')).toHaveLength(2);
+    wrapper.unmount();
+  });
 });

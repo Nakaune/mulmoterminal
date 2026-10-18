@@ -24,6 +24,7 @@ import { SESSION_AGENTS } from "../../common/sessionAgent.js";
 import { NOTIFY_KINDS } from "../../common/notifyKinds.js";
 import { DIR_ICON_MAX_CHARS } from "../../common/dirIcon.js";
 import type { QuickCommand } from "../../common/quickCommands.js";
+import type { ToolbarLink } from "../../common/toolbarLinks.js";
 import { isRecord } from "../../common/isRecord.js";
 import {
   ENV_NAME_RE,
@@ -149,6 +150,15 @@ export const quickCommandSchema = z.object({
   text: z.string(),
   agents: z.array(z.enum(SESSION_AGENTS)).optional(),
 }) satisfies z.ZodType<QuickCommand>;
+
+// Validation for common/toolbarLinks.ts's ToolbarLink. The url's SCHEME is checked in the
+// sanitizer rather than here: zod would only tell us the string is a string, and the thing that
+// matters is that `javascript:` never reaches an href.
+export const toolbarLinkSchema = z.object({
+  label: z.string(),
+  url: z.string(),
+  icon: z.string().optional(),
+}) satisfies z.ZodType<ToolbarLink>;
 
 // A colour scheme the user defined (#996), offered in Settings next to the four built-ins.
 //

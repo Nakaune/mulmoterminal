@@ -23,6 +23,7 @@ import { useFaviconState } from "./composables/useFaviconState";
 import { useSoundEnabled } from "./composables/useSoundEnabled";
 import { useAttentionSound, type SoundConfig } from "./composables/useAttentionSound";
 import { useUnloadGuard } from "./composables/useUnloadGuard";
+import { superseded, useActiveClient } from "./composables/useActiveClient";
 import { usePubSub } from "./composables/usePubSub";
 import { openTerminalAt } from "./composables/useNewTerminal";
 import { LAUNCH_TERMINAL_CHANNEL, isLaunchAgent, type LaunchAgent } from "../common/launchAgent";
@@ -46,6 +47,9 @@ const unsubscribeLaunch = usePubSub().subscribe(LAUNCH_TERMINAL_CHANNEL, (data) 
 });
 onUnmounted(unsubscribeLaunch);
 
+// Newest tab wins: a tab opened later (any device) supersedes this one, which then goes inert.
+useActiveClient();
+
 // Warn on close/reload while anything is running. The grid reports its own count; nothing else
 // reports one any more, now that there is no second view holding a PTY of its own.
 useUnloadGuard();
@@ -65,31 +69,51 @@ const { soundFile, soundKinds, sounds } = useAppConfig();
 const soundConfig = computed<SoundConfig>(() => ({ kinds: soundKinds.value, sounds: sounds.value, soundFile: soundFile.value }));
 useAttentionSound(soundEnabled, soundConfig);
 
+const reload = (): void => location.reload();
+
 // Reflect session activity in the tab's favicon (idle / working / attention).
 useFaviconState(sessions);
 </script>
 
 <template>
-  <GridView />
-  <!-- The full-screen overlays, on TOP of the grid rather than instead of it. Each is route-driven
+  <div v-if="superseded" class="fixed inset-0 z-[1000] flex items-center justify-center bg-base p-4" role="alertdialog" aria-labelledby="superseded-title">
+    <div class="flex w-full max-w-[420px] flex-col items-start gap-3 rounded-lg border border-border bg-panel p-5 text-left">
+      <span class="material-symbols-outlined text-[28px] text-dim" aria-hidden="true">tab_close_right</span>
+      <h2 id="superseded-title" class="m-0 font-sans text-[15px] font-semibold text-fg">Opened in another tab</h2>
+      <p class="m-0 font-sans text-[12px] leading-relaxed text-secondary">
+        This tab stopped so that it can't overwrite the grid or steal terminals from the tab you are using. You can close it.
+      </p>
+      <button
+        type="button"
+        class="cursor-pointer rounded border border-border bg-transparent px-3 py-1.5 font-sans text-[12px] text-fg hover:bg-hover"
+        @click="reload"
+      >
+        Use this tab instead
+      </button>
+    </div>
+  </div>
+  <template v-else>
+    <GridView />
+    <!-- The full-screen overlays, on TOP of the grid rather than instead of it. Each is route-driven
        and starts below the header (`top-10`), so the toolbar stays on screen and the view beneath
        one does not change while it is open (#1193). -->
-  <!-- Full-screen collection / feed browser; shown when the toolbar's Collections door, an index
+    <!-- Full-screen collection / feed browser; shown when the toolbar's Collections door, an index
        card or a ref hop opens it (driven by useCollectionBrowse). -->
-  <CollectionsBrowseOverlay />
-  <!-- Full-screen accounting view; opened by the toolbar's account_balance button
+    <CollectionsBrowseOverlay />
+    <!-- Full-screen accounting view; opened by the toolbar's account_balance button
        (driven by useAccountingView). Mutually exclusive with the browser above. -->
-  <AccountingOverlay />
-  <!-- Full-screen read-only wiki browser; opened by the toolbar's menu_book button
+    <AccountingOverlay />
+    <!-- Full-screen read-only wiki browser; opened by the toolbar's menu_book button
        (driven by useWikiBrowse). Mutually exclusive with the overlays above. -->
-  <WikiBrowseOverlay />
-  <!-- Full-screen cross-repo PR list; opened by the toolbar's call_merge button. -->
-  <PrsOverlay />
-  <!-- Full-screen file explorer + editor; opened by the toolbar's Files button, or by a terminal
+    <WikiBrowseOverlay />
+    <!-- Full-screen cross-repo PR list; opened by the toolbar's call_merge button. -->
+    <PrsOverlay />
+    <!-- Full-screen file explorer + editor; opened by the toolbar's Files button, or by a terminal
        header's Files button rooted at that terminal's own directory. -->
-  <FilesOverlay />
-  <!-- The one hover tip every cell-header chip opens (#1235). Mounted here, and only here, so the
+    <FilesOverlay />
+    <!-- The one hover tip every cell-header chip opens (#1235). Mounted here, and only here, so the
        document can never hold two — it teleports to <body> and positions itself against whichever
        chip the pointer is on. -->
-  <HoverTip />
+    <HoverTip />
+  </template>
 </template>

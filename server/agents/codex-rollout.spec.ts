@@ -1,9 +1,9 @@
 // @vitest-environment node
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, statSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { readRolloutTail } from "./codex-rollout";
+import { readRolloutTail, walkForNewest } from "./codex-rollout";
 
 // A rollout is re-read on EVERY poll of the gauge, from a request handler, and the only thing
 // wanted is the last `rate_limits` in it. Reading more than the tail is pure cost, repeated
@@ -43,5 +43,46 @@ describe("readRolloutTail", () => {
   // an absent agent as absent.
   it("says nothing for a file that is not there", () => {
     expect(readRolloutTail(path.join(dir, "never-written.jsonl"))).toEqual([]);
+  });
+});
+
+// The gauge no longer wants "the newest file" but "the newest few", because the busiest session
+// can be spending a different budget than the one being shown (codex-rate-limits.ts). Order is the
+// whole contract: the caller stops at the first file that answers, so a wrong order means an old
+// reading wins over a current one.
+describe("walkForNewest", () => {
+  let root: string;
+
+  const rollout = (relative: string, mtime_sec: number): string => {
+    const file = path.join(root, relative);
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, "{}");
+    utimesSync(file, mtime_sec, mtime_sec);
+    return file;
+  };
+
+  beforeEach(() => {
+    root = mkdtempSync(path.join(tmpdir(), "mt-sessions-"));
+  });
+
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("returns every rollout in the tree, newest first", () => {
+    const older = rollout("2026/08/25/rollout-a.jsonl", 1_000_000);
+    const newest = rollout("2026/08/27/rollout-c.jsonl", 3_000_000);
+    const middle = rollout("2026/08/26/rollout-b.jsonl", 2_000_000);
+
+    expect(walkForNewest(root, 9_000_000_000)).toEqual([newest, middle, older]);
+  });
+
+  it("ignores files that are not rollouts", () => {
+    rollout("2026/08/27/notes.txt", 3_000_000);
+    const real = rollout("2026/08/27/rollout-a.jsonl", 1_000_000);
+
+    expect(walkForNewest(root, 9_000_000_000)).toEqual([real]);
+  });
+
+  it("says nothing for a tree that is not there", () => {
+    expect(walkForNewest(path.join(root, "never-created"), 9_000_000_000)).toEqual([]);
   });
 });

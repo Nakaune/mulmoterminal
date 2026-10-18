@@ -7,6 +7,8 @@ import {
   runningCount,
   addCell,
   setSession,
+  setReportedSession,
+  setReviewPending,
   setCwd,
   setCellAgent,
   setCellParked,
@@ -465,6 +467,13 @@ describe("nextAttention (jump to a terminal that needs you)", () => {
 });
 
 describe("setSession / setCwd / toggleExpand", () => {
+  it("persists review for the same session and clears it when the cell is replaced", () => {
+    const marked = setReviewPending(make([cell(0, U(0))]), 0, true);
+    expect(marked.cells[0].reviewPending).toBe(true);
+    expect(setSession(marked, 0, U(0)).cells[0].reviewPending).toBe(true);
+    expect(setSession(marked, 0, U(1)).cells[0].reviewPending).toBeUndefined();
+    expect(setReviewPending(marked, 0, false).cells[0].reviewPending).toBeUndefined();
+  });
   it("promotes a launch cell to running", () => {
     const s = setSession(make([cell(0)]), 0, U(5));
     expect(s.cells[0].session).toBe(U(5));
@@ -882,7 +891,42 @@ describe("zoomedUid / visibleCells", () => {
   });
 });
 
+// What a terminal reports is written into its cell only when the cell asked for it. A terminal
+// still attached to a session the shared grid has since moved to another cell must not write that
+// session back here: that is how one session was cloned into two cells and another lost.
+describe("setReportedSession", () => {
+  const s = make([cell(0, U(0)), cell(1, U(1)), cell(2, null)]);
+  it("fills a launching cell", () => {
+    expect(setReportedSession(s, 2, U(5), null).cells[2].session).toBe(U(5));
+  });
+  it("accepts the id the cell already holds", () => {
+    expect(setReportedSession(s, 0, U(0), U(0))).toEqual(s);
+  });
+  it("accepts a server-minted id for the session the cell requested", () => {
+    expect(setReportedSession(s, 0, U(7), U(0)).cells[0].session).toBe(U(7));
+  });
+  it("ignores a report for a session this cell no longer holds", () => {
+    expect(setReportedSession(s, 0, U(1), U(1))).toBe(s); // uid 0 now holds U(0); the terminal is still on U(1)
+    expect(setReportedSession(s, 0, U(9), U(1))).toBe(s); // nor a minted id for that stale request
+  });
+  it("ignores an unknown uid", () => {
+    expect(setReportedSession(s, 42, U(1), null)).toBe(s);
+  });
+});
+
 describe("parseGridState / migrateLegacy / initialState", () => {
+  it("restores only a literal true review marker", () => {
+    const restored = parseGridState(
+      JSON.stringify({
+        cells: [
+          { ...cell(0, U(0)), reviewPending: true },
+          { ...cell(1, U(1)), reviewPending: "true" },
+        ],
+      }),
+    );
+    expect(restored?.cells[0].reviewPending).toBe(true);
+    expect(restored?.cells[1].reviewPending).toBeUndefined();
+  });
   it("keeps running cells, renumbers uids, and drops malformed entries", () => {
     const raw = JSON.stringify({ cells: [cell(0, U(0)), { uid: 1, session: "bad", cwd: null }, cell(2, U(2))], expanded: 2, page: 0, nextUid: 3 });
     const s = parseGridState(raw);
@@ -926,6 +970,40 @@ describe("parseGridState / migrateLegacy / initialState", () => {
     expect(s.cells.map((c) => c.uid)).toEqual([0, 1, 2]); // renumbered — no collision
     expect(s.nextUid).toBe(3);
     expect(Number.isSafeInteger(s.nextUid)).toBe(true);
+  });
+  // The shared grid's parse. Every browser keys its mounted cells by uid, so the numbers on the
+  // wire have to survive the round trip, or a snapshot hands each live terminal another cell's
+  // session (what happened on 2026-10-01: sessions cloned over one another, one lost).
+  it("keeps distinct persisted uids and the zoom's uid when asked to", () => {
+    const raw = JSON.stringify({
+      cells: [cell(4, U(0)), cell(9, U(1)), { uid: 11, session: null, cwd: null }, cell(2, U(2))],
+      expanded: 9,
+      page: 0,
+      nextUid: 12,
+    });
+    const s = parseGridState(raw, { keepUids: true });
+    if (!s) throw new Error("expected parsed state");
+    expect(s.cells.map((c) => c.uid)).toEqual([4, 9, 2]); // as persisted, launch cell still dropped
+    expect(s.expanded).toBe(9); // the uid, not an index
+    expect(s.nextUid).toBe(12); // the persisted counter, never below max uid + 1
+  });
+  it("counts nextUid on from the largest kept uid when the persisted counter is behind", () => {
+    const s = parseGridState(JSON.stringify({ cells: [cell(7, U(0)), cell(3, U(1))], nextUid: 2 }), { keepUids: true });
+    expect(s?.nextUid).toBe(8);
+  });
+  it("falls back to renumbering when kept uids collide or are not usable", () => {
+    const dup = parseGridState(JSON.stringify({ cells: [cell(1, U(0)), cell(1, U(1))], expanded: 1 }), { keepUids: true });
+    expect(dup?.cells.map((c) => c.uid)).toEqual([0, 1]);
+    const huge = parseGridState(JSON.stringify({ cells: [cell(0, U(0)), { uid: Number.MAX_SAFE_INTEGER, session: U(1), cwd: null }] }), { keepUids: true });
+    expect(huge?.cells.map((c) => c.uid)).toEqual([0, 1]);
+    expect(huge?.nextUid).toBe(2);
+    const fractional = parseGridState(JSON.stringify({ cells: [cell(0.5, U(0))] }), { keepUids: true });
+    expect(fractional?.cells.map((c) => c.uid)).toEqual([0]);
+  });
+  it("still renumbers from position by default", () => {
+    const s = parseGridState(JSON.stringify({ cells: [cell(4, U(0)), cell(9, U(1))], expanded: 9 }));
+    expect(s?.cells.map((c) => c.uid)).toEqual([0, 1]);
+    expect(s?.expanded).toBe(1);
   });
   it("migrates the legacy single-grid shape into the flat list", () => {
     const legacy = JSON.stringify({ sessions: [U(0), null, U(2), null], cwds: ["/a", null, "/c", null], expanded: 1 });

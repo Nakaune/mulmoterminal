@@ -32,6 +32,30 @@ export interface ProbePty {
   kill(): void;
   /** The probe's own output. Read only to explain a failure — see probe-stall.ts. */
   onData(listener: (chunk: string) => void): void;
+  /** Keys for the TUI. Used ONLY once the status line has reported (see `reported` below): before
+   *  that the TUI may still be booting, and keys typed at a TUI that is not listening are
+   *  discarded or, worse, confirm whatever dialog is up (#1293). */
+  write(data: string): void;
+}
+
+// The per-model weekly windows ("Current week (Fable)") are not in the status line
+// (claude-usage-cache.ts) — they are written to `~/.claude.json` by claude's own `/usage`. So once
+// the probe's question has been answered, which proves the TUI is taking input, it opens `/usage`
+// and waits for that file to change. The slash menu needs a moment to filter before Enter picks
+// the command; the fetch itself landed within a second when measured (2.1.285, 2026-10-01).
+export const USAGE_COMMAND = "/usage";
+export const USAGE_MENU_DELAY_MS = 600;
+export const USAGE_POLL_MS = 500;
+// Longer than the fetch needs, shorter than PROBE_TIMEOUT_MS: a probe whose `/usage` never lands
+// (an older claude, a dialog that did not open) still ends in seconds, not in a minute and a half.
+export const USAGE_WAIT_MS = 15_000;
+
+/** A running probe. `stop` is the timeout's and the caller's way out; `reported` is for the moment
+ *  the status line has delivered the windows, after which the probe collects `/usage` and stops
+ *  itself. */
+export interface ProbeHandle {
+  stop(): void;
+  reported(): void;
 }
 
 /** How a probe ended: what its terminal proved, and the terminal itself for the cases where it
@@ -50,10 +74,13 @@ export interface ProbeDeps {
   cwd: string;
   sessionId: string;
   onSettled: (outcome: ProbeOutcome) => void;
+  /** When claude last wrote its usage cache, or null. Polled after `/usage` is sent: a change is
+   *  what says the per-model windows have landed and the terminal can go. */
+  usageCacheFetchedAt_ms: () => number | null;
 }
 
 /**
- * Start one probe. Returns a stop function, called both by the timeout and by the report arriving.
+ * Start one probe. Returns its handle: `stop` for the timeout, `reported` for the report arriving.
  *
  * Failure has no branch of its own HERE on purpose: a trust prompt nobody answered, a login that
  * expired, a machine too slow to boot the TUI — all of them look the same from inside one probe
@@ -68,7 +95,7 @@ export interface ProbeDeps {
  * What this DOES carry out is the screen: the terminal is the only place a stalled probe leaves any
  * evidence at all, so `onSettled` gets what was on it (#1293).
  */
-export function startRateLimitProbe(deps: ProbeDeps): () => void {
+export function startRateLimitProbe(deps: ProbeDeps): ProbeHandle {
   // Setup is inside the guard, not before it. It reaches the disk — a full or read-only tmp throws
   // — and the caller has ALREADY marked a probe in flight by the time this runs. An escape here
   // would leave that flag set with nothing to clear it, so the gauge would stop refreshing for the
@@ -83,17 +110,19 @@ export function startRateLimitProbe(deps: ProbeDeps): () => void {
     settings = { dir, file };
   } catch {
     deps.onSettled({ stall: "unknown", screen: "" });
-    return () => {};
+    return { stop: () => {}, reported: () => {} };
   }
   const { dir, file: settingsFile } = settings;
 
   let stopped = false;
   let pty: ProbePty | null = null;
   let screen = "";
+  const usage = newUsageWatch();
   const stop = (): void => {
     if (stopped) return;
     stopped = true;
     clearTimeout(timer);
+    clearUsageWatch(usage);
     try {
       pty?.kill();
     } catch {
@@ -117,7 +146,47 @@ export function startRateLimitProbe(deps: ProbeDeps): () => void {
     // `claude` is not installed, or cannot be launched at all. Same outcome as any other failure.
     stop();
   }
-  return stop;
+  // The windows are in: the TUI has answered, so it is listening. Idempotent, because the status
+  // line can fire more than once with the windows in it.
+  const reported = (): void => {
+    if (stopped || usage.requested || pty === null) return;
+    openUsage(pty, deps, stop, usage);
+  };
+  return { stop, reported };
+}
+
+/** The timers behind one probe's `/usage` request, so stop() can clear whatever is pending. */
+interface UsageWatch {
+  requested: boolean;
+  timers: ReturnType<typeof setTimeout>[];
+  poll: ReturnType<typeof setInterval> | null;
+}
+const newUsageWatch = (): UsageWatch => ({ requested: false, timers: [], poll: null });
+function clearUsageWatch(watch: UsageWatch): void {
+  for (const t of watch.timers) clearTimeout(t);
+  if (watch.poll !== null) clearInterval(watch.poll);
+}
+
+/** Ask the TUI for `/usage` and leave as soon as claude has written its cache — or after
+ *  USAGE_WAIT_MS if it never does. A terminal that is already gone makes write() throw; the
+ *  windows the status line delivered stand, so that just ends the probe. */
+function openUsage(pty: ProbePty, deps: Pick<ProbeDeps, "usageCacheFetchedAt_ms">, stop: () => void, watch: UsageWatch): void {
+  watch.requested = true;
+  const before = deps.usageCacheFetchedAt_ms();
+  const type = (keys: string): void => {
+    try {
+      pty.write(keys);
+    } catch {
+      stop();
+    }
+  };
+  type(USAGE_COMMAND);
+  watch.timers.push(setTimeout(() => type("\r"), USAGE_MENU_DELAY_MS));
+  watch.timers.push(setTimeout(stop, USAGE_WAIT_MS));
+  watch.poll = setInterval(() => {
+    const now = deps.usageCacheFetchedAt_ms();
+    if (now !== null && now !== before) stop();
+  }, USAGE_POLL_MS);
 }
 
 /**

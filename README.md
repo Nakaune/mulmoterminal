@@ -129,23 +129,34 @@ copying from a web page usually does, so that pasting text keeps working.
 <a id="clicking-a-file-path"></a>
 
 **Clicking a file path** — the other direction. A path an agent *prints* becomes a link, and
-**what it opens is chosen by its extension**, so each kind arrives as the thing it is rather
-than as bytes (files within the session's working directory only):
+clicking it **reveals the file in the OS file manager** (Windows Explorer on WSL, Finder on
+macOS): the containing folder opens with the file **selected**. The file itself is never handed
+to whatever program the OS associates with its extension — reading a path an agent printed must
+not run anything.
 
-| A clicked … | opens as |
+A path printed *relative* to the session's working directory (`src/main.ts`) resolves against it,
+and an absolute one is taken as it stands — including one outside that directory, which is what a
+sibling worktree or a `~/.claude/…` path is. A directory opens as itself.
+
+**From another machine** the file manager would open on the server's desktop, where nobody is
+looking, so there the click opens the file **inside the app** instead. "Another machine" is read
+off the address bar: `localhost` is the desktop, anything else — the `127.0.0.1` of an SSH tunnel,
+the machine's Tailscale name — is not.
+
+| What was clicked | Where it opens |
 |---|---|
-| `.md` `.markdown` | **rendered** markdown in a new tab — the same sandboxed `…/md` HTML the Files preview uses. It follows your system light/dark setting, since under the sandbox CSP it can't ask the app which theme is on |
-| `.json` | **indented** in a new tab (Chrome and Safari otherwise show one long line) |
-| `.csv` `.tsv` | a **table** in a new tab, with a sticky header that scrolls inside its own box |
-| source, config, logs, and `.txt` — 46 extensions | the app's own **Files** view (`/files?path=`), where CodeMirror highlights it, the tree is right there, and it can be edited |
-| everything else — images, PDF, SVG, HTML, video | raw bytes in a new tab, which the browser renders better than an editor would |
+| source, `.txt` | the Files pane beside an enlarged cell when the path is under that cell's directory, otherwise the full-screen **Files view** |
+| `.md` · `.json` · `.csv` / `.tsv` | a new tab: rendered Markdown, indented JSON, a table |
+| anything else (images, PDF, HTML) | a new tab through the raw route |
 
-**While a grid cell is enlarged, the [Files pane](#files-view-browse--edit) takes the click first** — every
-row above except the last one, since the pane is the same editor plus a Markdown preview. The
-file opens *beside* the terminal that printed it, and the pane opens itself if it was closed.
-It declines, leaving the routing above untouched, when nothing is enlarged, when the path is
-not under that cell's own directory (the pane cannot walk above its root), or for the raw-bytes
-row, where it would only show an empty editor.
+A path outside the session's working directory still opens: it is served from another live
+session's directory when one contains it, and otherwise from the file's own folder. The raw route
+serves from session directories only, so **an image or PDF that is under no open session's
+directory answers 403**; text has no such limit (up to 2 MB).
+
+*(Both halves are local-fork changes. Upstream routes every click by extension into the app's own
+viewers, scoped to the session's working directory. Those routes are what the remote click uses,
+and they stay reachable from the Files view on the desktop.)*
 
 Highlighting in the Files view covers the JS/TS family, JSON and Markdown (the modes
 `cmEditor.ts` bundles); other languages open as plain text.
@@ -480,6 +491,13 @@ up for Codex, loaded by description.
 
 ## Session persistence (tmux)
 
+**The grid is shared between browsers connected to the same server.** Cell order, session
+placement, page, zoom and sort mode are stored in `~/.mulmoterminal/grid-state.json` and update
+live in every open tab. On the first run after upgrading, the first browser that already has a
+session migrates its existing `localStorage` grid; an empty remote browser cannot replace it.
+Ephemeral Run cells and an unfinished launch form stay browser-local because another browser
+cannot reattach them.
+
 If **`tmux` is installed**, MulmoTerminal runs each Claude session and launcher inside
 a tmux session, so **a server crash or restart doesn't kill your terminals** — the
 processes keep running and reattach when the server comes back (like `screen`/`tmux`).
@@ -771,6 +789,16 @@ Settings → Directory settings names both files and lists which keys the local 
 ![Four projects color-coded in the grid, each in its own palette](https://raw.githubusercontent.com/receptron/mulmoterminal/main/docs/guide/images/grid-colors.png)
 
 *As cells pile up it gets hard to tell which project is which. Give each repo a **name badge** and its own colors in `.mulmoterminal.json` and they're unmistakable — `headerColor`/`badgeColor` tint the frame, while `colors` reaches all the way into the **terminal's own background and text**. (The example above dresses four repos in Mondrian / van Gogh / Picasso / Matisse palettes.)*
+
+**A repository with no colours gets one on its own** *(local fork)*. In this workspace a cell's
+colour says which repository it belongs to, so a directory that names no colour takes its
+repository's: the ones its working tree's root names (a cell opened in `repo/apps/mobile`), else
+the ones the main checkout names (a linked worktree), else a hue reserved for the repository the
+first time it is seen. The reserved hue is the one furthest from every hue in use, is written to
+`~/.mulmoterminal/repo-colors.jsonl`, and never moves afterwards — delete its line to have it
+picked again. An unnamed directory is badged with the repository's name (a linked worktree with
+its own folder's). A colour written in any of the three files always wins, and a directory outside
+a git repository is left alone.
 
 | Field        | Meaning |
 | ------------ | ------- |
@@ -1732,6 +1760,13 @@ Key rules:
 - A background session that goes **idle** (`Stop`) is **reaped** (killed). If it
   finished with unseen output, its `waiting` flag persists via the on-disk
   session record, so it stays listed and **bold** until you open it.
+- **A connection that breaks is not a close.** The grace above applies to a socket
+  the client closed — a cell shut, a tab gone, a reload. One that died without a
+  close frame (code `1006`: the machine slept, the wifi went, the tunnel dropped)
+  leaves the session alive indefinitely instead, until someone reattaches or closes
+  it. Over loopback the distinction never comes up; from a browser on another
+  machine it is the difference between coming back to your agent and coming back to
+  nothing.
 - **Reattach over respawn**: selecting a session that still has a live background
   PTY reattaches to it (replaying a ≤ 64 KB output tail) instead of spawning a
   duplicate `claude`.

@@ -6,11 +6,11 @@ const base = { resume: null, model: null, guiMcpServers: [] };
 
 describe("buildCodexArgs", () => {
   it("passes no id for a fresh session (codex mints its own)", () => {
-    expect(buildCodexArgs({ ...base })).toEqual([]);
+    expect(buildCodexArgs({ ...base })).toEqual(["--no-daemon"]);
   });
 
   it("adds the model override before the subcommand", () => {
-    expect(buildCodexArgs({ ...base, model: "gpt-5.4" })).toEqual(["--model", "gpt-5.4"]);
+    expect(buildCodexArgs({ ...base, model: "gpt-5.4" })).toEqual(["--no-daemon", "--model", "gpt-5.4"]);
   });
 
   it("resumes a known rollout id via the resume subcommand", () => {
@@ -26,6 +26,7 @@ describe("buildCodexArgs", () => {
     // interpolated loopback URL; a static http literal here trips no-clear-text-protocols).
     const url = "gui-mcp-endpoint";
     expect(buildCodexArgs({ ...base, guiMcpServers: [{ id: "mulmoterminal-gui", url, autoApprove: true }] })).toEqual([
+      "--no-daemon",
       "-c",
       `mcp_servers.mulmoterminal-gui.url="${url}"`,
       "-c",
@@ -45,6 +46,7 @@ describe("buildCodexArgs", () => {
       ],
     });
     expect(args).toEqual([
+      "--no-daemon",
       "-c",
       `mcp_servers.mulmoterminal-render.url="render-endpoint"`,
       "-c",
@@ -67,7 +69,7 @@ describe("buildCodexArgs", () => {
   // and nothing else — the prompt is the point. See codexGuiMcpServers.
   it("omits the approval line for a server that is not auto-approved", () => {
     const args = buildCodexArgs({ ...base, guiMcpServers: [{ id: "mulmoterminal-media", url: "media-endpoint", autoApprove: false }] });
-    expect(args).toEqual(["-c", `mcp_servers.mulmoterminal-media.url="media-endpoint"`]);
+    expect(args).toEqual(["--no-daemon", "-c", `mcp_servers.mulmoterminal-media.url="media-endpoint"`]);
     expect(args.join(" ")).not.toContain("approval_mode");
   });
 });

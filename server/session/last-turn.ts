@@ -4,8 +4,9 @@
 // flight is skipped: codex writes its rollout lazily, so "what it is saying right now"
 // simply isn't on disk (#254).
 
-import { conversationTurnsFromParsed, parseJsonl } from "./transcript.js";
+import { conversationTurnsFromParsed, parseJsonl, preferredHeaderPrompt, type ConversationTurn } from "./transcript.js";
 import { codexEventPayload as eventPayload } from "../agents/codex-events.js";
+import { codexUserTurnText } from "../agents/codex-user-turn.js";
 
 export interface LastTurn {
   prompt: string | null;
@@ -41,6 +42,34 @@ export const lastTurnFromClaudeJsonl = (raw: string): LastTurn => lastTurnFromCl
 // rows is reached through `eventPayload` above, which is shared with the badge reader.
 const trimmedString = (value: unknown): string | null => (typeof value === "string" && value.trim() ? value.trim() : null);
 
+/** The newest meaningful Codex prompt, including the turn that is still running. */
+export function latestCodexPromptFromParsed(docs: Record<string, unknown>[]): string | null {
+  let latest: string | null = null;
+  for (const doc of docs) {
+    const text = codexUserTurnText(doc);
+    if (text) latest = preferredHeaderPrompt(latest, text);
+  }
+  return latest;
+}
+
+/** Normalize Codex rollout rows for the shared title generator. */
+export function conversationTurnsFromCodexParsed(docs: Record<string, unknown>[]): ConversationTurn[] {
+  const turns: ConversationTurn[] = [];
+  for (const doc of docs) {
+    const user = codexUserTurnText(doc);
+    if (user) {
+      turns.push({ role: "user", text: user });
+      continue;
+    }
+    const assistant = trimmedString(eventPayload(doc, "task_complete")?.last_agent_message);
+    if (assistant) turns.push({ role: "assistant", text: assistant });
+  }
+  return turns;
+}
+
+export const countCodexUserTurnsFromParsed = (docs: Record<string, unknown>[]): number =>
+  conversationTurnsFromCodexParsed(docs).filter((turn) => turn.role === "user").length;
+
 // Walk back to the task_started that opened this turn, then forward to the first
 // prompt inside it. An unpaired task_complete (a rollout whose head was rotated away)
 // leaves no start, and the turn is reported prompt-less rather than borrowing an
@@ -58,11 +87,8 @@ function codexPromptForTurn(docs: Record<string, unknown>[], completeIndex: numb
   if (start < 0) return null;
   for (let i = start + 1; i < completeIndex; i++) {
     const doc = docs[i];
-    const message = doc === undefined ? null : eventPayload(doc, "user_message");
-    if (message) {
-      const text = trimmedString(message.message);
-      if (text) return text;
-    }
+    const text = doc === undefined ? null : codexUserTurnText(doc);
+    if (text) return text;
   }
   return null;
 }

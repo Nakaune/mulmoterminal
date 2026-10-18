@@ -1,3 +1,5 @@
+import { isTerminalAgent, type SessionAgent } from "../../common/sessionAgent.js";
+
 // Pure decision for how a /ws connection should (re)connect a requested session id.
 // Split out from index.ts so the flag choice — the one that decides `--resume` vs
 // `--session-id` — is unit-testable without a pty, tmux, or the filesystem.
@@ -34,6 +36,27 @@ export function resolveSession(requested: string | null, facts: SessionFacts, mi
   // mint a fresh one.
   const sessionId = reattachId ?? (requested && (facts.tmuxAlive || resume) ? requested : mintId());
   return { reattachId, resume, sessionId };
+}
+
+/** Whether a session that is ALIVE under some id may be served to the endpoint asking for it.
+ *
+ *  `?session=` is only ever what the browser last held, and a grid cell relaunched as another agent
+ *  can carry its old id into the new endpoint. Nothing downstream looks — `startCodexEntry`
+ *  reattaches whatever pty the id holds — so picking codex in a cell that used to run claude hands
+ *  back claude's RUNNING session: the same conversation in two grid cells, one of them labelled
+ *  codex (seen in grid-state.json on 2026-09-22, uid 1 and uid 7 both holding 73f189b9).
+ *
+ *  Answering `false` is what lets the id fall through to `mintId()` in the resolvers above, so the
+ *  user who asked for a new codex session gets one — rather than an error about a cell they never
+ *  touched, or someone else's conversation.
+ *
+ *  Only a KNOWN agent counts as a mismatch. A pane at a shell, a launcher running the user's own
+ *  command line, a program tmux cannot name: none of those say whose session it is, and guessing
+ *  there would refuse reattaches that are perfectly good. `agent` is absent for the launcher, which
+ *  reattaches whatever is in the pane on purpose. */
+export function servesAgent(running: string | null | undefined, agent: SessionAgent | undefined): boolean {
+  if (agent === undefined || !running) return true;
+  return !isTerminalAgent(running) || running === agent;
 }
 
 // ── the same decision for the two non-claude terminals ─────────────────────────
