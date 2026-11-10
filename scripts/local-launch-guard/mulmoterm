@@ -95,8 +95,23 @@ HEATMAP_PORT="${MT_HEATMAP_PORT:-34569}"
 HEATMAP_SCRIPT="$HOME/.local/bin/mt-heatmap-server.mjs"
 HEATMAP_LOG="$HOME/.mulmoterminal/heatmap-server.log"
 
-listening() { ss -ltn 2>/dev/null | grep -q ":${PORT} "; }
-proxy_listening() { ss -ltn 2>/dev/null | grep -q ":${PROXY_PORT} "; }
+# WSL netlink can block ss indefinitely; read the TCP listener tables directly.
+port_listening() {
+  python3 - "$1" <<'PY'
+import sys
+port = int(sys.argv[1])
+for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+    with open(table) as rows:
+        next(rows)
+        for row in rows:
+            fields = row.split()
+            if fields[3] == "0A" and int(fields[1].rsplit(":", 1)[1], 16) == port:
+                sys.exit(0)
+sys.exit(1)
+PY
+}
+listening() { port_listening "$PORT"; }
+proxy_listening() { port_listening "$PROXY_PORT"; }
 
 proxy_pids() {
   pgrep -f "mt-origin-proxy.mjs" 2>/dev/null
@@ -130,7 +145,7 @@ stop_proxy() {
   done
 }
 
-heatmap_listening() { ss -ltn 2>/dev/null | grep -q ":${HEATMAP_PORT} "; }
+heatmap_listening() { port_listening "$HEATMAP_PORT"; }
 heatmap_pids() { pgrep -f "mt-heatmap-server.mjs" 2>/dev/null; }
 
 start_heatmap() {
@@ -159,6 +174,21 @@ stop_heatmap() {
     heatmap_listening || break
     sleep 1
   done
+}
+
+ensure_codex_daemon() {
+  # Linux の codex セルは `codex --remote unix://` で共有 app-server daemon に繋ぐ (server/agents/codex-args.ts)。
+  # daemon は自分では上がらず、socket の実体は /tmp にあるので WSL 再起動で消える。そのまま起動すると
+  # codex セルは新規も復元も "app-server socket is not available" で即終了する (2026-11-08)。
+  # `daemon start` は稼働中なら何もしない。失敗しても MulmoTerminal 本体の起動は止めない。
+  local codex_bin="${CODEX_BIN:-$(command -v codex 2>/dev/null)}"
+  [ -n "$codex_bin" ] || return 0
+  # Do not let the long-lived daemon inherit the startup flock.
+  if ! timeout 60 "$codex_bin" app-server daemon start >/dev/null 2>&1 9>&-; then
+    echo "mulmoterm: Codex の app-server daemon を起動できませんでした。codex セルは起動直後に終わります" >&2
+    echo "  手動で: codex app-server daemon start" >&2
+  fi
+  return 0
 }
 
 server_pids() {
@@ -326,6 +356,7 @@ start() {
   disown 2>/dev/null
 
   # 起動時に install は行わない。失敗時は検証済み release を再選択できる。
+  ensure_codex_daemon
   for _ in $(seq 1 60); do
     listening && break
     kill -0 "$startup_pid" 2>/dev/null || break
